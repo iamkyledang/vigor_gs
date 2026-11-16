@@ -55,3 +55,32 @@ def trained_interface(scene_dir, tmp_path_factory):
     dataset.linear_rgb = True
     history = training(dataset, opt, pipe, testing_iterations=[1, 400], saving_iterations=[400])
     return Namespace(dataset=dataset, opt=opt, pipe=pipe, history=history, root=root, iterations=400)
+
+
+@pytest.fixture(scope='session')
+def trained_reflection(trained_interface):
+    """
+    A short Phase II run on top of `trained_interface`, with a glass plane fitted to it (or, if the short Phase I
+    run left nothing to fit, a hand-set plane). Tests that use this must be marked `gpu` and `data`.
+    """
+    import hashlib
+    from argparse import ArgumentParser, Namespace
+
+    from arguments import ReflectionOptimizationParams
+    from extract_plane import extract_plane
+    from train_reflection import training
+
+    root, dataset = trained_interface.root, trained_interface.dataset
+    try:
+        extract_plane(dataset)
+    except RuntimeError:
+        extract_plane(dataset, manual_plane=[0.0, 0.0, 1.0, 0.0])
+
+    interface_files = [p for p in sorted((root / 'interface').rglob('*')) if p.suffix in ('.ply', '.pth')]
+    digests = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in interface_files}
+
+    parser = ArgumentParser()
+    op = ReflectionOptimizationParams(parser)
+    opt = op.extract(parser.parse_args(['--iterations', '300', '--warm_up', '150', '--refl_init_points', '5000', '--densify_from_iter', '100']))
+    history = training(dataset, opt, trained_interface.pipe, testing_iterations=[1, 300], saving_iterations=[300])
+    return Namespace(opt=opt, history=history, iterations=300, interface_digests=digests)

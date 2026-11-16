@@ -47,6 +47,11 @@ class ParamGroup:
         for arg in vars(args).items():
             if arg[0] in vars(self) or ('_' + arg[0]) in vars(self):
                 setattr(group, arg[0], arg[1])
+        # A cfg_args written before a parameter existed does not mention it: fall back to its default.
+        for key, value in vars(self).items():
+            name = key[1:] if key.startswith('_') else key
+            if not hasattr(group, name):
+                setattr(group, name, value)
         return group
 
 
