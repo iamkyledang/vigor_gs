@@ -12,8 +12,8 @@ pytestmark = [pytest.mark.gpu, pytest.mark.data]
 def rendered(trained_interface, trained_reflection):
     from render_vigor import render_sets
 
-    loaded_iter = render_sets(trained_interface.dataset, trained_interface.pipe, skip_train=True)
-    return trained_interface.root / 'test' / f'ours_{loaded_iter}', loaded_iter
+    label = render_sets(trained_interface.dataset, trained_interface.pipe, skip_train=True)
+    return trained_interface.root / 'test' / label, label
 
 
 def read(path):
@@ -21,8 +21,8 @@ def read(path):
 
 
 def test_layout_matches_what_metrics_reads(rendered, trained_reflection):
-    out_dir, loaded_iter = rendered
-    assert loaded_iter == trained_reflection.iterations
+    out_dir, label = rendered
+    assert label == f'ours_{trained_reflection.iterations}'
     names = sorted(p.name for p in (out_dir / 'renders').iterdir())
     assert len(names) == 34 and names[0] == '00000.png'
     for folder in ('gt', 'transparent_masks'):
@@ -58,7 +58,7 @@ def test_metrics_runs_on_the_rendered_set(rendered, trained_interface):
     evaluate([str(trained_interface.root)])
     with open(trained_interface.root / 'results.json') as f:
         results = json.load(f)
-    method = f'ours_{rendered[1]}'
+    method = rendered[1]
     for key in ('SSIM', 'PSNR', 'LPIPS', 'Masked SSIM', 'Masked PSNR', 'Masked LPIPS'):
         assert np.isfinite(results[method][key]), key
     assert results[method]['PSNR'] > 13.0

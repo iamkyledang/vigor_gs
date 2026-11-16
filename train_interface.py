@@ -63,7 +63,7 @@ def interface_losses(out, viewpoint_cam, gaussians, opt, iteration, offsets=None
     if iteration >= opt.reg_from_iter:
         if opt.mask_loss_weight > 0:
             losses['mask'] = opt.mask_loss_weight * binary_cross_entropy(out['glass_map'], gt_mask.float())
-        if opt.occupancy_decay_weight > 0:
+        if opt.occupancy_decay_weight > 0 and gaussians.factorized:
             losses['occupancy'] = opt.occupancy_decay_weight * gaussians.get_occupancy[out['visibility_filter']].mean()
 
     if offsets is not None and opt.lambda_deform_reg > 0:
@@ -105,7 +105,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
     interface_path, tb_writer = prepare_output_and_logger(dataset)
 
     # The Scene reads and writes the point cloud of this phase under <model_path>/interface.
-    gaussians = InterfaceGaussianModel(dataset.sh_degree)
+    gaussians = InterfaceGaussianModel(dataset.sh_degree, factorized=not getattr(dataset, 'ablate_factorization', False))
     scene = Scene(phase_args(dataset, INTERFACE_DIR), gaussians, resolution_scales=[1.0])
     gaussians.training_setup(opt)
 

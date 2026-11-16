@@ -21,13 +21,20 @@ class InterfaceGaussianModel(GaussianField):
     INIT_OCCUPANCY = 0.1
     INIT_SCALE_FACTOR = 0.1
 
-    def __init__(self, sh_degree: int):
+    def __init__(self, sh_degree: int, factorized: bool = True):
+        """
+        factorized=False is the ablation without the p * o factorization: every disk has p = 1, so a single
+        opacity has to play both roles and both passes render the same thing.
+        """
         super().__init__(sh_degree)
+        self.factorized = factorized
         self.occupancy_activation = torch.sigmoid
         self.inverse_occupancy_activation = inverse_sigmoid
 
     @property
     def get_occupancy(self):
+        if not self.factorized:
+            return torch.ones_like(self._occupancy)
         return self.occupancy_activation(self._occupancy)
 
     @property
@@ -49,7 +56,8 @@ class InterfaceGaussianModel(GaussianField):
     def densify_and_prune(self, max_grad, min_occupancy, extent, max_screen_size, last_reset_iter):
         self.densify(max_grad, extent)
 
-        prune_mask = (self.get_occupancy < min_occupancy).squeeze(-1)
+        presence = self.get_occupancy if self.factorized else self.get_opacity
+        prune_mask = (presence < min_occupancy).squeeze(-1)
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent

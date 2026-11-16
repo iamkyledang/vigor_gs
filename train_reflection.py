@@ -12,6 +12,9 @@ h_psi are fitted to the original images:
 Reads <model_path>/interface and <model_path>/glass_plane.json, writes <model_path>/reflection.
 
     python train_reflection.py -m output/<scene>
+
+Ablations (model parameters, see arguments/__init__.py): --ablate_virtual_camera, --ablate_fresnel and
+--shared_reflection_field, which has no G_R at all and renders the frozen interface through the virtual camera.
 """
 
 import os
@@ -26,7 +29,7 @@ from gaussian_renderer.vigor import render_composite, render_direct
 from scene.deform_model import DeformModel
 from scene.reflection_model import ReflectionGaussianModel
 from train_interface import time_noise_std
-from utils.fresnel import OpticalCorrection, optical_loss, schlick_f0
+from utils.fresnel import BlendModel, optical_loss
 from utils.general_utils import safe_state
 from utils.image_utils import psnr
 from utils.loss_utils import l1_loss, ssim
@@ -73,16 +76,17 @@ class DirectCache:
 
 
 @torch.no_grad()
-def evaluate_composite(cameras, interface, interface_deform, reflection, reflection_deform, pipe, background, normal, offset, f0, correction=None, use_gt_mask=False):
+def evaluate_composite(cameras, interface, interface_deform, reflection, reflection_deform, pipe, background, normal, offset, blend, use_gt_mask=False, use_virtual_camera=True):
     """
     Mean PSNR against the original images of the composite and of the direct image alone, over the whole image
-    and over the glass region. The gap between the two is what the reflection field explains.
+    and over the glass region. The gap between the two is what the reflection explains.
     """
     stats = {'psnr': [], 'psnr_direct': [], 'glass_psnr': [], 'glass_psnr_direct': []}
     for cam in cameras:
         direct_out = render_direct(cam, interface, interface_deform, pipe, background)
         glass_map = cam.gt_transparent_mask.cuda().float() if use_gt_mask else direct_out['glass_map']
-        out = render_composite(cam, direct_out['direct'], glass_map, reflection, pipe, normal, offset, reflection_offsets=reflection_deform.step(reflection.get_xyz, cam.time), f0=f0, correction=correction)
+        offsets = reflection_deform.step(reflection.get_xyz, cam.time)
+        out = render_composite(cam, direct_out['direct'], glass_map, reflection, pipe, normal, offset, reflection_offsets=offsets, blend=blend, use_virtual_camera=use_virtual_camera)
         gt_image = cam.original_image[:3].cuda()
         composite, direct = out['composite'].clamp(0.0, 1.0), out['direct'].clamp(0.0, 1.0)
         stats['psnr'].append(psnr(composite, gt_image).mean().item())
@@ -94,7 +98,7 @@ def evaluate_composite(cameras, interface, interface_deform, reflection, reflect
     return {key: float(np.mean(values)) if values else float('nan') for key, values in stats.items()}
 
 
-def prepare_output_and_logger(args, opt):
+def prepare_output_and_logger(args):
     reflection_path = os.path.join(args.model_path, REFLECTION_DIR)
     print('Output folder: {}'.format(reflection_path))
     os.makedirs(reflection_path, exist_ok=True)
@@ -108,7 +112,7 @@ def prepare_output_and_logger(args, opt):
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, interface_iteration=-1):
-    reflection_path, tb_writer = prepare_output_and_logger(dataset, opt)
+    _, tb_writer = prepare_output_and_logger(dataset)
 
     # ---- Phase I results, frozen for the whole of Phase II
     scene, interface, interface_deform = load_interface(dataset, interface_iteration, shuffle=True)
@@ -119,7 +123,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, interfac
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device='cuda')
-    f0 = schlick_f0(dataset.eta_air, dataset.eta_glass)
+    use_virtual_camera = not dataset.ablate_virtual_camera
 
     viewpoint_stack = scene.getTrainCameras(scale=1.0).copy()
     num_frames = len(viewpoint_stack)
@@ -127,37 +131,70 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, interfac
     direct_cache = DirectCache(viewpoint_stack, interface, interface_deform, pipe, background, use_gt_mask=opt.gt_glass_mask)
 
     # ---- What Phase II trains
-    reflection = ReflectionGaussianModel(dataset.sh_degree)
-    reflection.create_random(normal, offset, camera_centers, scene.cameras_extent, opt.refl_init_points, opt.refl_init_radius_scale, opt.refl_init_color)
-    reflection.training_setup(opt)
+    blend = BlendModel.from_args(dataset).cuda()
+    blend_optimizer = torch.optim.Adam(blend.parameters(), lr=opt.optical_lr) if blend.is_trainable else None
 
-    reflection_deform = DeformModel.from_args(ReflectionGaussianModel.SCALE_DIM, dataset)
-    reflection_deform.train_setting(opt, spatial_lr_scale=scene.cameras_extent)
+    own_field = not dataset.shared_reflection_field
+    if own_field:
+        reflection = ReflectionGaussianModel(dataset.sh_degree)
+        reflection.create_random(normal, offset, camera_centers, scene.cameras_extent, opt.refl_init_points, opt.refl_init_radius_scale, opt.refl_init_color)
+        reflection.training_setup(opt)
+        reflection_deform = DeformModel.from_args(ReflectionGaussianModel.SCALE_DIM, dataset)
+        reflection_deform.train_setting(opt, spatial_lr_scale=scene.cameras_extent)
+    else:
+        # Shared-field ablation: the reflection is the frozen interface itself, seen from the virtual camera.
+        reflection, reflection_deform = interface, interface_deform
+        if blend_optimizer is None:
+            print('Shared reflection field with pure Fresnel mixing: nothing to train, evaluating only.')
 
-    correction, correction_optimizer = None, None
-    if dataset.optical_correction:
-        correction = OpticalCorrection().cuda()
-        correction_optimizer = torch.optim.Adam(correction.parameters(), lr=opt.optical_lr)
+    num_iterations = opt.iterations if (own_field or blend_optimizer is not None) else 0
+    testing_iterations = sorted(set(i for i in testing_iterations if i <= num_iterations) | {num_iterations})
+    saving_iterations = sorted(set(i for i in saving_iterations if 0 < i <= num_iterations) | {num_iterations})
+
+    def evaluate(iteration):
+        torch.cuda.empty_cache()
+        results = []
+        train_subset = [viewpoint_stack[idx % num_frames] for idx in range(5, 30, 5)]
+        for name, cameras in (('test', scene.getTestCameras()), ('train', train_subset)):
+            if not cameras:
+                continue
+            metrics = evaluate_composite(cameras, interface, interface_deform, reflection, reflection_deform, pipe, background, normal, offset, blend, opt.gt_glass_mask, use_virtual_camera)
+            results.append({'iteration': iteration, 'split': name, **metrics})
+            print(
+                f'\n[ITER {iteration}] Evaluating {name}: PSNR {metrics["psnr"]:.3f} (direct only {metrics["psnr_direct"]:.3f}), '
+                f'glass PSNR {metrics["glass_psnr"]:.3f} (direct only {metrics["glass_psnr_direct"]:.3f})'
+            )
+            if tb_writer:
+                for key, value in metrics.items():
+                    tb_writer.add_scalar(f'{name}/{key}', value, iteration)
+        torch.cuda.empty_cache()
+        return results
+
+    def save(iteration):
+        print('\n[ITER {}] Saving reflection'.format(iteration))
+        save_reflection(dataset.model_path, iteration, blend, reflection if own_field else None, reflection_deform if own_field else None)
 
     history = []
     ema_loss_dict = {}
-    progress_bar = tqdm(range(0, opt.iterations), desc='Reflection training')
+    progress_bar = tqdm(range(0, num_iterations), desc='Reflection training')
 
-    for iteration in range(1, opt.iterations + 1):
-        reflection.update_learning_rate(iteration)
-        reflection_deform.update_learning_rate(iteration)
-
-        if iteration % 1000 == 0:
-            reflection.oneupSHdegree()
+    for iteration in range(1, num_iterations + 1):
+        if own_field:
+            reflection.update_learning_rate(iteration)
+            reflection_deform.update_learning_rate(iteration)
+            if iteration % 1000 == 0:
+                reflection.oneupSHdegree()
 
         viewpoint_cam = viewpoint_stack[np.random.randint(num_frames)]
         direct, glass_map = direct_cache(viewpoint_cam)
 
-        deforming = iteration > opt.warm_up
-        offsets = reflection_deform.step(reflection.get_xyz, viewpoint_cam.time, time_noise_std(opt, iteration, num_frames)) if deforming else None
+        # The reflection field trains statically first; a shared (frozen) field always uses its own deformation.
+        deforming = iteration > opt.warm_up if own_field else True
+        noise = time_noise_std(opt, iteration, num_frames) if own_field else 0.0
+        offsets = reflection_deform.step(reflection.get_xyz, viewpoint_cam.time, noise) if deforming else None
 
-        out = render_composite(viewpoint_cam, direct, glass_map, reflection, pipe, normal, offset, reflection_offsets=offsets, f0=f0, correction=correction)
-        loss_dict = reflection_losses(out, viewpoint_cam, opt, offsets)
+        out = render_composite(viewpoint_cam, direct, glass_map, reflection, pipe, normal, offset, reflection_offsets=offsets, blend=blend, use_virtual_camera=use_virtual_camera)
+        loss_dict = reflection_losses(out, viewpoint_cam, opt, offsets if own_field else None)
         loss = sum(loss_dict.values())
         loss.backward()
 
@@ -167,8 +204,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, interfac
             if iteration % 10 == 0:
                 progress_bar.set_postfix({**{k: f'{v:.4f}' for k, v in ema_loss_dict.items()}, 'Points': reflection.num_points})
                 progress_bar.update(10)
-            if iteration == opt.iterations:
-                progress_bar.close()
 
             if tb_writer:
                 tb_writer.add_scalar('train_loss/total', loss.item(), iteration)
@@ -177,28 +212,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, interfac
                 tb_writer.add_scalar('total_points', reflection.num_points, iteration)
 
             if iteration in testing_iterations:
-                torch.cuda.empty_cache()
-                train_subset = [viewpoint_stack[idx % num_frames] for idx in range(5, 30, 5)]
-                for name, cameras in (('test', scene.getTestCameras()), ('train', train_subset)):
-                    if not cameras:
-                        continue
-                    metrics = evaluate_composite(cameras, interface, interface_deform, reflection, reflection_deform, pipe, background, normal, offset, f0, correction, opt.gt_glass_mask)
-                    history.append({'iteration': iteration, 'split': name, **metrics})
-                    print(
-                        f'\n[ITER {iteration}] Evaluating {name}: PSNR {metrics["psnr"]:.3f} (direct only {metrics["psnr_direct"]:.3f}), '
-                        f'glass PSNR {metrics["glass_psnr"]:.3f} (direct only {metrics["glass_psnr_direct"]:.3f})'
-                    )
-                    if tb_writer:
-                        for key, value in metrics.items():
-                            tb_writer.add_scalar(f'{name}/{key}', value, iteration)
-                torch.cuda.empty_cache()
-
+                history.extend(evaluate(iteration))
             if iteration in saving_iterations:
-                print('\n[ITER {}] Saving reflection'.format(iteration))
-                save_reflection(dataset.model_path, iteration, reflection, reflection_deform, correction)
+                save(iteration)
 
             # Densification
-            if iteration < opt.densify_until_iter:
+            if own_field and iteration < opt.densify_until_iter:
                 visibility_filter, radii = out['visibility_filter'], out['radii']
                 reflection.max_radii2D[visibility_filter] = torch.max(reflection.max_radii2D[visibility_filter], radii[visibility_filter])
                 reflection.add_densification_stats(out['viewspace_points'], visibility_filter, iteration)
@@ -210,15 +229,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, interfac
                 if iteration % opt.opacity_reset_interval == 0:
                     reflection.reset_opacity()
 
-            if iteration < opt.iterations:
-                reflection.optimizer.step()
-                reflection.optimizer.zero_grad(set_to_none=True)
-                if deforming:
-                    reflection_deform.optimizer.step()
-                reflection_deform.optimizer.zero_grad(set_to_none=True)
-                if correction_optimizer is not None:
-                    correction_optimizer.step()
-                    correction_optimizer.zero_grad(set_to_none=True)
+            if iteration < num_iterations:
+                if own_field:
+                    reflection.optimizer.step()
+                    reflection.optimizer.zero_grad(set_to_none=True)
+                    if deforming:
+                        reflection_deform.optimizer.step()
+                    reflection_deform.optimizer.zero_grad(set_to_none=True)
+                if blend_optimizer is not None:
+                    blend_optimizer.step()
+                    blend_optimizer.zero_grad(set_to_none=True)
+    progress_bar.close()
+
+    if num_iterations == 0:
+        history.extend(evaluate(0))
+        save(0)
 
     if tb_writer:
         tb_writer.close()
@@ -236,12 +261,11 @@ if __name__ == '__main__':
     parser.add_argument('--save_iterations', nargs='+', type=int, default=[])
     parser.add_argument('--quiet', action='store_true')
     args = get_combined_args(parser, cfg_subdir=INTERFACE_DIR)
-    args.save_iterations.append(args.iterations)
 
     print('Optimizing ' + args.model_path)
     safe_state(args.quiet)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.interface_iteration)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, getattr(args, 'interface_iteration', -1))
 
     print('\nReflection training complete.')

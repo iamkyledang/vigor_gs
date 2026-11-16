@@ -89,6 +89,14 @@ class ModelParams(ParamGroup):
         self.eta_glass = 1.5
         self.optical_correction = False  # learn the small reflectance correction h_psi on top of Schlick
 
+        # VIGOR-GS ablations. Each one removes a single design choice; they are saved in cfg_args and apply
+        # to every later step of the same model.
+        self.ignore_clean_images = False  # Phase I fits the original images even where clean ones exist
+        self.ablate_factorization = False  # no occupancy: the interface has a single opacity (p = 1)
+        self.ablate_virtual_camera = False  # render the reflection field from the real camera
+        self.ablate_fresnel = False  # replace the Schlick weight by one learned constant
+        self.shared_reflection_field = False  # no separate G_R: the reflection is G_I seen from the virtual camera
+
         super().__init__(parser, 'Loading Parameters', sentinel)
 
     def extract(self, args):

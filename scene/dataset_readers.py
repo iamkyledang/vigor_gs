@@ -324,7 +324,7 @@ def _find_by_stem(folder, stem):
     return None
 
 
-def readVigorSceneInfo(path, eval, clean_images='clean', clean_fallback_original=False):
+def readVigorSceneInfo(path, eval, clean_images='clean', clean_fallback_original=False, ignore_clean_images=False):
     """
     Reader for the VIGOR-GS scene layout:
 
@@ -336,7 +336,8 @@ def readVigorSceneInfo(path, eval, clean_images='clean', clean_fallback_original
         <scene>/<clean_images>/<stem>.*     reflection-removed targets I_t^clean
 
     `clean_images` may be absolute or relative to the scene folder. A missing clean image is an error unless
-    `clean_fallback_original` is set, in which case the original image stands in for it.
+    `clean_fallback_original` is set, in which case the original image stands in for it. `ignore_clean_images`
+    skips the clean folder altogether (the single-field ablation that fits the original images).
     """
     colmap_dir = os.path.join(path, 'colmap')
     sparse_dir = os.path.join(colmap_dir, 'sparse', '0')
@@ -386,10 +387,10 @@ def readVigorSceneInfo(path, eval, clean_images='clean', clean_fallback_original
             mismatched_masks += 1
 
         clean_image = None
-        clean_path = _find_by_stem(clean_dir, stem)
+        clean_path = None if ignore_clean_images else _find_by_stem(clean_dir, stem)
         if clean_path is not None:
             clean_image = Image.open(clean_path)
-        else:
+        elif not ignore_clean_images:
             missing_clean.append(name)
 
         cam_infos.append(

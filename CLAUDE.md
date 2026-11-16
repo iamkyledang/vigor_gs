@@ -2,11 +2,17 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project status: README vs. code
+## Two code paths in one repo
 
-The README describes **VIGOR-GS**: two Gaussian fields trained in two phases (a frozen 2DGS interface field used to fit a glass plane, then a 3DGS reflection field rendered from a camera mirrored across that plane, blended with a Fresnel weight), each with its own deformation MLP. The code this repo started from is the **RT-Splatting** (CVPR 2026) baseline (see `git show 1a3c021:README.md`): a single hybrid surface/volume 2D-Gaussian model with a learned specular branch.
+1. **VIGOR-GS** (the project): two Gaussian fields trained in two phases, each with its own deformation MLP. See "VIGOR-GS architecture" below.
+2. **RT-Splatting baseline** (CVPR 2026, what the repo started from, see `git show 1a3c021:README.md`): a single hybrid surface/volume 2D-Gaussian model with a learned specular branch. Its files (`train.py`, `render.py`, `scene/gaussian_model.py`, `gaussian_renderer/__init__.py`, `eval.sh`) are kept untouched for comparison. See "Baseline architecture".
 
-VIGOR-GS is being built module by module on top of that baseline, one commit per module (`NN-name: ...` commit messages). The spec is `docs/VIGOR_GS_Academic_Framework (2).pdf` plus `reference.md`; **where they disagree, `reference.md` wins** (the glass plane is extracted from the interface field, and glass masks are used). `guildance.md` is an older commit plan and is not authoritative. The baseline files (`train.py`, `render.py`, `scene/gaussian_model.py`, `gaussian_renderer/__init__.py`) stay untouched for comparison; VIGOR-GS code goes in new files.
+VIGOR-GS is built module by module, one commit per module (`NN-name: ...` commit messages, written in Vietnamese). The spec is `docs/VIGOR_GS_Academic_Framework (2).pdf` plus `reference.md`; **where they disagree, `reference.md` wins** (the glass plane is extracted from the interface field, and glass masks are used). `guildance.md` is an older commit plan and is not authoritative.
+
+Open issues that are not code bugs:
+- **No clean images yet.** Phase I should train on reflection-removed targets; the datasets have none, so runs use `--clean_fallback_original` and the reflections get baked into the direct image, leaving Phase II nothing to explain.
+- **Single-plane assumption vs. the data.** VIGOR-GS assumes one glass plane. The glass in `3D-FRONT-T/scene_1` is a multi-pane glass box with cameras orbiting it, so one plane fits only one face (about 40% inliers).
+- Pure Schlick gives a reflection weight of about 0.04 at normal incidence, so the reflection field must be very bright to matter, and its gradients are scaled down by the same factor.
 
 ## Environment & commands
 
@@ -31,9 +37,23 @@ pip install --no-build-isolation submodules/diff-gaussian-rasterization
 pip install --no-build-isolation git+https://github.com/NVlabs/nvdiffrast
 ```
 
-After editing any `.cu`/`.h` file under `submodules/`, reinstall that submodule with the same `pip install --no-build-isolation ...` command. Python code imports the compiled package (`diff_surfel_anych`, `simple_knn._C`), not the source tree. GLM sits in `submodules/diff-surfel-anych/third_party/glm` and is included via `-I` in `setup.py`.
+After editing any `.cu`/`.h` file under `submodules/`, reinstall that submodule with the same `pip install --no-build-isolation ...` command (in WSL, put `/usr/local/cuda/bin` on `PATH` first). Python code imports the compiled package (`diff_surfel_anych`, `diff_gaussian_rasterization`, `simple_knn._C`), not the source tree. GLM sits in `submodules/diff-surfel-anych/third_party/glm`; both rasterizers include it from there.
 
-Pipeline (one scene; `eval.sh` lists the per-scene hyperparameters used for every benchmark scene):
+VIGOR-GS pipeline for one scene (`-m` is the model root; each step reads what the previous one wrote):
+
+```shell
+python train_interface.py -s data/datasets/datasets/3D-FRONT-T/scene_1 -m output/scene_1 -r 4 --eval --clean_fallback_original
+python extract_plane.py -m output/scene_1          # or: --glass_plane NX NY NZ D to set it by hand
+python train_reflection.py -m output/scene_1
+python render_vigor.py -m output/scene_1           # --skip_train to render the test split only
+python metrics.py -m output/scene_1
+```
+
+- On the 4 GB GPU use `-r 4`, a small deformation MLP (`--deform_width 64 --deform_depth 4`) and a few thousand iterations; the defaults are 30,000 iterations per phase.
+- Scene settings (`-s`, `-r`, `--eval`, deformation sizes, `--linear_rgb`) are given once to `train_interface.py`. Later steps read them from `<model>/interface/cfg_args`, and `render_vigor.py` from `<model>/reflection/cfg_args`.
+- `train_interface.py` trains on linear RGB unless `--srgb` is passed; saved images are converted back to sRGB.
+
+Baseline pipeline (one scene; `eval.sh` lists the per-scene hyperparameters used for every benchmark scene):
 
 ```shell
 python train.py -s data/rt-splatting/van -r 4 --eval --env_scope_center -0.5 -1 0.5 --env_scope_radius 2.5 --init_until_iter 700 --norm_loss_from_iter 700 --xyz_axis 2.0 1.0 0.0
@@ -58,7 +78,37 @@ python metrics.py -m output/van     # writes results.json / per_view.json into t
 - Cameras must be PINHOLE or SIMPLE_PINHOLE (undistorted). `convert.py` is the standard 3DGS COLMAP conversion script.
 - With `--eval`, every 8th image (sorted by name) goes to the test split (`llffhold=8`).
 
-## Architecture
+## VIGOR-GS architecture
+
+**Results layout.** `<model>/interface/` (Phase I: `cfg_args`, `point_cloud/iteration_N/point_cloud.ply`, `deform/iteration_N/deform.pth`), `<model>/glass_plane.json`, `<model>/reflection/` (Phase II, same structure, plus `blend/iteration_N/blend.pth` for the alpha parameters). `utils/vigor_utils.py` holds these names and `load_interface` / `load_reflection`.
+
+**Two fields on one base class.** `scene/gaussian_field.py::GaussianField` owns parameters, the optimizer, clone/split/prune surgery, PLY I/O and checkpoints. Per-Gaussian parameters are declared once in the `PARAMS` tuple (parameter `name` lives in `self._<name>` and in the optimizer group `name`); a subclass that adds one extends `PARAMS`, `_initial_extra_params` and `_learning_rates`, nothing else.
+- `InterfaceGaussianModel` (`scene/interface_model.py`): 2D disks with **occupancy `p`** (geometric presence) and **opacity `o`** (optical contribution). Densification and pruning follow `p`.
+- `ReflectionGaussianModel` (`scene/reflection_model.py`): plain 3DGS ellipsoids, initialized from random points on the camera side of the glass (the reflected scene has no SfM points).
+
+**Deformation** (`scene/deform_model.py`): one `DeformModel` per field maps (canonical center, time) to `(d_xyz, d_rotation, d_scaling)`. The output layer is zero-initialized, so a fresh network is the identity. `p`, `o` and colors are never deformed. Renderers take the offsets as an argument (`offsets=None` renders the canonical field), so the training scripts control warm-up and timestamp noise.
+
+**Phase I** (`train_interface.py`, `gaussian_renderer/interface.py`). `render_interface` rasterizes the disks twice with `diff_surfel_anych`: a volume pass with `p*o` gives the direct image `B_t` (`'direct'`), and a surface pass with `p` alone gives the interface geometry and `'glass_map' = 1 - surface_opacity`, i.e. where the first surface is present but transparent. Losses: L1+D-SSIM of `B_t` against `Camera.clean_image`, normal consistency, BCE of the glass map against the glass mask, occupancy decay.
+
+**Glass plane** (`extract_plane.py`, `utils/plane_utils.py`): median-depth points of the surface pass inside the glass masks, pooled over training views, fitted with RANSAC + SVD. Convention: `n^T x + d = 0`, `|n| = 1`, cameras on the positive side.
+
+**Phase II** (`train_reflection.py`, `gaussian_renderer/vigor.py`). Phase I is frozen and its `B_t` and glass map are rendered once per training view (`DirectCache`). The reflection field stays in **real world coordinates** and is rendered through the virtual camera `reflect_camera` (`utils/virtual_camera.py`), whose view matrix is `W2C * M` with `M` the plane reflection; the result lines up pixel for pixel with the real camera, so nothing is flipped and the Gaussians are never mirrored. `utils/fresnel.py` gives `alpha = clip(Schlick(cos) + h_psi) * glass_map` and the blend `(1 - alpha) B + alpha R`, supervised by the original image. `BlendModel` bundles whatever decides alpha (no parameters by default) and is what gets saved and passed to `render_composite`.
+
+**Inference** (`render_vigor.py`) writes the same `renders/`, `gt/`, `transparent_masks/`, `vis/` layout as the baseline, so `metrics.py` is shared.
+
+**Ablations** are `ModelParams` flags, so they are saved in `cfg_args` and every later step of the same model follows them. Give each variant its own `-m` folder.
+
+| Flag | Given to | What it removes |
+|---|---|---|
+| `--ablate_factorization` | `train_interface.py` | The `p*o` factorization: one opacity drives both passes (`InterfaceGaussianModel(factorized=False)`). |
+| `--ignore_clean_images` | `train_interface.py` | Clean supervision: one field fits the original images. Evaluate with `render_vigor.py --direct_only`, which needs no Phase II and writes `direct_<iter>/`. |
+| `--ablate_virtual_camera` | `train_reflection.py` | The mirrored camera: the reflection field is rendered from the real camera. |
+| `--ablate_fresnel` | `train_reflection.py` | The Schlick weight: one learned constant per scene, still gated by the glass map. |
+| `--shared_reflection_field` | `train_reflection.py` | The separate reflection field: the reflection is the frozen interface seen from the virtual camera. With pure Fresnel there is nothing to train and the result is saved as iteration 0. |
+
+**Arguments.** `ModelParams` is shared by both code paths and saved to `cfg_args`; `InterfaceOptimizationParams` and `ReflectionOptimizationParams` belong to the two phases. `get_combined_args(parser, cfg_subdir=...)` drops command-line options left at `None`, so read optional script flags with `getattr`; parameters missing from an older `cfg_args` fall back to their defaults in `ParamGroup.extract`.
+
+## Baseline architecture
 
 **One `GaussianModel` (`scene/gaussian_model.py`), 2D surfels.** Scales have 2 components (2DGS). Each Gaussian carries SH color, `occupancy`, `opacity`, `transmissivity`, `reflectance`, `roughness` and a 4-dim `language_feature` (a misnomer: it is the specular feature, not language). The model also owns two global networks: `dir_encoding` (`SphMipEncoding`, a learnable equirectangular feature map sampled with `nvdiffrast.torch.texture` with mip level from roughness) and `light_mlp`.
 

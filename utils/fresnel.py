@@ -75,22 +75,56 @@ class OpticalCorrection(nn.Module):
         return self.head(self.trunk(features)).reshape(1, height, width)
 
 
-def fresnel_weight(camera, normal, offset, glass_map=None, f0=None, correction: OpticalCorrection = None):
+def fresnel_weight(camera, normal, offset, glass_map=None, f0=None, correction: OpticalCorrection = None, constant=None):
     """
     The reflection weight alpha_t(u) for a camera.
 
     glass_map: (1, H, W) in [0, 1], where the interface is glass (None: glass everywhere).
-    Returns a dict with alpha, fresnel (Schlick term alone), cos_theta and h (None without a correction), all
-    (1, H, W).
+    constant: a scalar tensor that replaces the Schlick term everywhere (the no-Fresnel ablation).
+    Returns a dict with alpha, fresnel (Schlick term alone, or the constant), cos_theta and h (None without a
+    correction), all (1, H, W).
     """
     f0 = schlick_f0() if f0 is None else f0
     cos_theta, glass_points = glass_geometry(camera, normal, offset)
-    fresnel = schlick_reflectance(cos_theta, f0)
+    fresnel = schlick_reflectance(cos_theta, f0) if constant is None else constant.expand_as(cos_theta)
     h = correction(glass_points, cos_theta, getattr(camera, 'time', 0.0)) if correction is not None else None
     alpha = (fresnel if h is None else fresnel + h).clamp(0.0, 1.0)
     if glass_map is not None:
         alpha = alpha * glass_map
     return {'alpha': alpha, 'fresnel': fresnel, 'cos_theta': cos_theta, 'h': h}
+
+
+class BlendModel(nn.Module):
+    """
+    Everything that decides the reflection weight alpha, in one saveable module.
+
+    By default it has no parameters at all: alpha is the Schlick reflectance on the glass. Two options add some:
+        use_correction   learn h_psi on top of Schlick                       (--optical_correction)
+        learn_constant   replace Schlick by one learned scalar per scene     (--ablate_fresnel)
+    """
+
+    def __init__(self, f0=None, use_correction=False, learn_constant=False):
+        super().__init__()
+        self.f0 = schlick_f0() if f0 is None else f0
+        self.correction = OpticalCorrection() if use_correction else None
+        # The constant starts at the normal-incidence reflectance, so both variants begin from the same blend.
+        self.constant_logit = nn.Parameter(torch.logit(torch.tensor(float(self.f0)))) if learn_constant else None
+
+    @classmethod
+    def from_args(cls, args):
+        return cls(
+            f0=schlick_f0(getattr(args, 'eta_air', 1.0), getattr(args, 'eta_glass', 1.5)),
+            use_correction=getattr(args, 'optical_correction', False),
+            learn_constant=getattr(args, 'ablate_fresnel', False),
+        )
+
+    @property
+    def is_trainable(self):
+        return any(p.requires_grad for p in self.parameters())
+
+    def forward(self, camera, normal, offset, glass_map=None):
+        constant = torch.sigmoid(self.constant_logit) if self.constant_logit is not None else None
+        return fresnel_weight(camera, normal, offset, glass_map=glass_map, f0=self.f0, correction=self.correction, constant=constant)
 
 
 def composite(direct, reflection, alpha):

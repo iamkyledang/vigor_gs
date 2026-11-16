@@ -85,12 +85,16 @@ def render_interface(viewpoint_camera, pc: InterfaceGaussianModel, pipe, bg_colo
 
     rasterizer = make_rasterizer(viewpoint_camera, bg_color, pc.active_sh_degree, scaling_modifier)
 
+    # Without the p * o factorization (ablation) a single opacity drives both passes.
+    volume_weight = occupancy * opacity if pc.factorized else opacity
+    surface_weight = occupancy if pc.factorized else opacity
+
     # Volume pass: effective opacity p * o
-    direct, _, _, volume_allmap = rasterizer(means3D=means3D, means2D=screenspace_points, shs=shs, extras=None, opacities=occupancy * opacity, scales=scales, rotations=rotations, cov3D_precomp=None)
+    direct, _, _, volume_allmap = rasterizer(means3D=means3D, means2D=screenspace_points, shs=shs, extras=None, opacities=volume_weight, scales=scales, rotations=rotations, cov3D_precomp=None)
     volume_alpha, volume_depth, volume_normal, volume_depth_normal, volume_dist = unpack_allmap(volume_allmap, viewpoint_camera, pipe.depth_ratio)
 
     # Surface pass: occupancy alone; the per-disk opacity is blended as an extra channel
-    surface_color, surface_extras, radii, surface_allmap = rasterizer(means3D=means3D, means2D=screenspace_points, shs=shs, extras=opacity, opacities=occupancy, scales=scales, rotations=rotations, cov3D_precomp=None)
+    surface_color, surface_extras, radii, surface_allmap = rasterizer(means3D=means3D, means2D=screenspace_points, shs=shs, extras=opacity, opacities=surface_weight, scales=scales, rotations=rotations, cov3D_precomp=None)
     surface_alpha, surface_depth, surface_normal, surface_depth_normal, surface_dist = unpack_allmap(surface_allmap, viewpoint_camera, pipe.depth_ratio)
     surface_opacity = surface_extras[0:1]
 
