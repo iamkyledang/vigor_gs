@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from scene.cameras import Camera
+from utils.color_utils import srgb2linear
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
 
@@ -61,6 +62,16 @@ def loadCam(args, id, cam_info, resolution_scale):
     resized_image_rgb = PILtoTorch(cam_info.image, resolution)
     gt_transparent_mask = PILtoTorch(cam_info.transparent_mask, resolution) > 0
 
+    clean_image = None
+    if getattr(cam_info, 'clean_image', None) is not None:
+        clean_image = PILtoTorch(cam_info.clean_image, resolution)[:3]
+
+    # The reflection blend is physically linear, so the VIGOR-GS pipeline trains on linear RGB.
+    if getattr(args, 'linear_rgb', False):
+        resized_image_rgb = torch.cat([srgb2linear(resized_image_rgb[:3]), resized_image_rgb[3:]], dim=0)
+        if clean_image is not None:
+            clean_image = srgb2linear(clean_image)
+
     gt_image = resized_image_rgb
     loaded_mask = None
 
@@ -79,6 +90,8 @@ def loadCam(args, id, cam_info, resolution_scale):
         image_name=cam_info.image_name,
         uid=id,
         data_device=args.data_device,
+        time=getattr(cam_info, 'time', 0.0),
+        clean_image=clean_image,
     )
 
 

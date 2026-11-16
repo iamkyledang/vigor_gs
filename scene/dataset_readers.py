@@ -45,6 +45,8 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
+    time: float = 0.0  # normalized timestamp in [0, 1]
+    clean_image: object = None  # reflection-removed target (PIL image), or None
 
 
 class SceneInfo(NamedTuple):
@@ -311,4 +313,131 @@ def readNerfSyntheticInfo(path, white_background, eval, extension='.png'):
     return scene_info
 
 
-sceneLoadTypeCallbacks = {'Colmap': readColmapSceneInfo, 'Blender': readNerfSyntheticInfo}
+IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.PNG', '.JPG', '.JPEG')
+
+
+def _find_by_stem(folder, stem):
+    for ext in IMAGE_EXTENSIONS:
+        candidate = os.path.join(folder, stem + ext)
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def readVigorSceneInfo(path, eval, clean_images='clean', clean_fallback_original=False):
+    """
+    Reader for the VIGOR-GS scene layout:
+
+        <scene>/colmap/images/<name>        original images I_t (undistorted, match the COLMAP cameras)
+        <scene>/colmap/sparse/0/            COLMAP model (PINHOLE cameras)
+        <scene>/colmap/frames.json          per-frame metadata, including the normalized time in [0, 1]
+        <scene>/colmap/split.json           {'train': [names], 'test': [names]}
+        <scene>/colmap/masks/<stem>.png     glass masks M_t (or the frame's 'source_mask' path)
+        <scene>/<clean_images>/<stem>.*     reflection-removed targets I_t^clean
+
+    `clean_images` may be absolute or relative to the scene folder. A missing clean image is an error unless
+    `clean_fallback_original` is set, in which case the original image stands in for it.
+    """
+    colmap_dir = os.path.join(path, 'colmap')
+    sparse_dir = os.path.join(colmap_dir, 'sparse', '0')
+    images_dir = os.path.join(colmap_dir, 'images')
+    clean_dir = clean_images if os.path.isabs(clean_images) else os.path.join(path, clean_images)
+
+    with open(os.path.join(colmap_dir, 'frames.json')) as f:
+        frames = {frame['name']: frame for frame in json.load(f)['frames']}
+    with open(os.path.join(colmap_dir, 'split.json')) as f:
+        split = json.load(f)
+    train_names, test_names = set(split['train']), set(split['test'])
+
+    cam_extrinsics = read_extrinsics_binary(os.path.join(sparse_dir, 'images.bin'))
+    cam_intrinsics = read_intrinsics_binary(os.path.join(sparse_dir, 'cameras.bin'))
+
+    cam_infos = []
+    missing_clean = []
+    mismatched_masks = 0
+    for extr in cam_extrinsics.values():
+        name = os.path.basename(extr.name)
+        # The COLMAP model may hold images that are not part of this scene (e.g. the other cameras of a rig).
+        if name not in train_names and name not in test_names:
+            continue
+        frame = frames[name]
+        stem = os.path.splitext(name)[0]
+
+        intr = cam_intrinsics[extr.camera_id]
+        if intr.model == 'SIMPLE_PINHOLE':
+            FovX = focal2fov(intr.params[0], intr.width)
+            FovY = focal2fov(intr.params[0], intr.height)
+        elif intr.model == 'PINHOLE':
+            FovX = focal2fov(intr.params[0], intr.width)
+            FovY = focal2fov(intr.params[1], intr.height)
+        else:
+            raise ValueError(f'Colmap camera model not handled: {intr.model} (only PINHOLE or SIMPLE_PINHOLE are supported)')
+
+        image_path = os.path.join(images_dir, name)
+        image = Image.open(image_path)
+
+        mask_path = os.path.join(colmap_dir, 'masks', stem + '.png')
+        if not os.path.exists(mask_path) and frame.get('source_mask'):
+            mask_path = os.path.join(path, frame['source_mask'])
+        if not os.path.exists(mask_path):
+            raise FileNotFoundError(f'No glass mask for {name}: looked in {os.path.join(colmap_dir, "masks")} and at the frame\'s source_mask ({frame.get("source_mask")})')
+        transparent_mask = Image.open(mask_path).convert('L')
+        if transparent_mask.size != image.size:
+            mismatched_masks += 1
+
+        clean_image = None
+        clean_path = _find_by_stem(clean_dir, stem)
+        if clean_path is not None:
+            clean_image = Image.open(clean_path)
+        else:
+            missing_clean.append(name)
+
+        cam_infos.append(
+            CameraInfo(
+                uid=extr.id,
+                R=np.transpose(qvec2rotmat(extr.qvec)),
+                T=np.array(extr.tvec),
+                FovY=FovY,
+                FovX=FovX,
+                image=image,
+                transparent_mask=transparent_mask,
+                image_path=image_path,
+                image_name=stem,
+                width=intr.width,
+                height=intr.height,
+                time=float(frame['time']),
+                clean_image=clean_image,
+            )
+        )
+
+    if missing_clean:
+        if not clean_fallback_original:
+            raise FileNotFoundError(
+                f'{len(missing_clean)} of {len(cam_infos)} frames have no clean (reflection-removed) image in {clean_dir}, e.g. {missing_clean[0]}. '
+                'Provide them (see --clean_images) or pass --clean_fallback_original to train on the original images instead.'
+            )
+        print(f'[ WARN ] No clean image for {len(missing_clean)} of {len(cam_infos)} frames in {clean_dir}; using the original images as clean targets.')
+    if mismatched_masks:
+        print(f'[ WARN ] {mismatched_masks} glass masks differ in size from their images and will be resized; check that they are aligned.')
+
+    cam_infos = sorted(cam_infos, key=lambda c: c.image_name)
+    if eval:
+        train_cam_infos = [c for c in cam_infos if os.path.basename(c.image_path) in train_names]
+        test_cam_infos = [c for c in cam_infos if os.path.basename(c.image_path) in test_names]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    ply_path = os.path.join(sparse_dir, 'points3D.ply')
+    if not os.path.exists(ply_path):
+        print('Converting point3d.bin to .ply, will happen only the first time you open the scene.')
+        xyz, rgb, _ = read_points3D_binary(os.path.join(sparse_dir, 'points3D.bin'))
+        storePly(ply_path, xyz, rgb)
+    pcd = fetchPly(ply_path)
+
+    return SceneInfo(point_cloud=pcd, train_cameras=train_cam_infos, test_cameras=test_cam_infos, nerf_normalization=nerf_normalization, ply_path=ply_path)
+
+
+sceneLoadTypeCallbacks = {'Colmap': readColmapSceneInfo, 'Blender': readNerfSyntheticInfo, 'Vigor': readVigorSceneInfo}

@@ -68,6 +68,11 @@ class ModelParams(ParamGroup):
         self.env_scope_radius = 0.0
         self.xyz_axis = [0.0, 0.0, 0.0]
 
+        # VIGOR-GS scene layout (see readVigorSceneInfo)
+        self.clean_images = 'clean'  # folder of reflection-removed targets, absolute or relative to the scene
+        self.clean_fallback_original = False  # use the original image where a clean one is missing
+        self.linear_rgb = False  # convert targets from sRGB to linear RGB at load time
+
         super().__init__(parser, 'Loading Parameters', sentinel)
 
     def extract(self, args):

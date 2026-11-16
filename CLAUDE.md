@@ -46,6 +46,13 @@ python metrics.py -m output/van     # writes results.json / per_view.json into t
 
 ## Data requirements
 
+**VIGOR-GS layout** (`readVigorSceneInfo`, chosen when `<scene>/colmap/frames.json` exists; this is what `data/datasets/datasets/*` uses):
+- Images come from `colmap/images/`, poses from `colmap/sparse/0/`, the train/test split from `colmap/split.json` (with `--eval`; `llffhold` is not used), and the per-frame `time` in [0, 1] from `colmap/frames.json`.
+- Glass masks: `colmap/masks/<stem>.png`, else the frame's `source_mask` path. Only 3D-FRONT-T masks are aligned with the COLMAP images; VSGD/Wayve masks are in the original (pre-undistortion) image size, and Wayve masks are privacy masks, not glass.
+- Clean (reflection-removed) targets: `<scene>/<--clean_images>/<stem>.*` (default folder `clean`). **The datasets ship none yet**, so loading fails unless `--clean_fallback_original` is passed, which makes `Camera.clean_image` alias the original image (`Camera.has_clean_image` tells which).
+- `--linear_rgb` converts both targets from sRGB to linear at load time.
+
+**Baseline layout** (plain COLMAP scene, used by `eval.sh`):
 - Only the COLMAP loader works end to end. A scene needs `images/`, `sparse/0/` and **`transparent_masks/<image_stem>.png`** for every image; loading fails without the masks. The Blender (`transforms_train.json`) loader never sets `transparent_mask` on `CameraInfo`, so it crashes in `loadCam`.
 - Cameras must be PINHOLE or SIMPLE_PINHOLE (undistorted). `convert.py` is the standard 3DGS COLMAP conversion script.
 - With `--eval`, every 8th image (sorted by name) goes to the test split (`llffhold=8`).

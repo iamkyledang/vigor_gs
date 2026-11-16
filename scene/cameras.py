@@ -32,10 +32,13 @@ class Camera(nn.Module):
         trans=np.array([0.0, 0.0, 0.0]),
         scale=1.0,
         data_device='cuda',
+        time=0.0,
+        clean_image=None,
     ):
         super(Camera, self).__init__()
 
         self.uid = uid
+        self.time = float(time)
         self.colmap_id = colmap_id
         self.R = R
         self.T = T
@@ -61,6 +64,10 @@ class Camera(nn.Module):
         else:
             self.original_image *= torch.ones((1, self.image_height, self.image_width), device=self.data_device)
             self.gt_alpha_mask = None
+
+        # Reflection-removed target for the interface phase. Without one, the original image stands in.
+        self.has_clean_image = clean_image is not None
+        self.clean_image = clean_image.clamp(0.0, 1.0).to(self.data_device) if self.has_clean_image else self.original_image[:3]
 
         self.zfar = 100.0
         self.znear = 0.01
