@@ -73,6 +73,12 @@ class ModelParams(ParamGroup):
         self.clean_fallback_original = False  # use the original image where a clean one is missing
         self.linear_rgb = False  # convert targets from sRGB to linear RGB at load time
 
+        # Deformation MLP architecture (scene/deform_model.py), shared by both VIGOR-GS fields
+        self.deform_depth = 8
+        self.deform_width = 256
+        self.deform_xyz_multires = 10
+        self.deform_time_multires = 6
+
         super().__init__(parser, 'Loading Parameters', sentinel)
 
     def extract(self, args):
