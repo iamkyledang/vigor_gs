@@ -2,7 +2,7 @@
 
 **Cập nhật:** 2026-11-16 · **Nhánh:** `viet_huynh` · **Commit mới nhất được mô tả:** `33d709d`
 
-Tài liệu này ghi lại ba việc: repo đã thay đổi những gì so với baseline RT-Splatting, kết quả các lượt chạy thử, và những điều ghi nhận được trong quá trình triển khai. Đặc tả phương pháp nằm ở `VIGOR_GS_Academic_Framework (2).pdf` và `reference.md`; hướng dẫn chạy nằm ở `README.md`.
+Tài liệu này ghi lại ba việc: repo đã thay đổi những gì so với baseline RT-Splatting, kết quả các lượt chạy thử, và những điều ghi nhận được trong quá trình triển khai. Đặc tả phương pháp nằm ở `VIGOR_GS_Academic_Framework (2).pdf` và `reference.md`; hướng dẫn chạy nằm ở `README.md`; giải thích chi tiết từng file code và lý do của từng lựa chọn cài đặt nằm ở [implementation_details.md](implementation_details.md).
 
 ## 1. Tóm tắt
 
