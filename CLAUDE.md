@@ -27,6 +27,7 @@ conda create -n rtsplat python=3.10 -y && conda activate rtsplat
 pip install -r requirements.txt            # torch==2.0.1, numpy<2, setuptools==81.0.0 are pinned
 pip install --no-build-isolation submodules/simple-knn
 pip install --no-build-isolation submodules/diff-surfel-anych
+pip install --no-build-isolation submodules/diff-gaussian-rasterization
 pip install --no-build-isolation git+https://github.com/NVlabs/nvdiffrast
 ```
 

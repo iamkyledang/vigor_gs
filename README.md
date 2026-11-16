@@ -18,6 +18,7 @@ pip install -r requirements.txt
 
 pip install --no-build-isolation submodules/simple-knn
 pip install --no-build-isolation submodules/diff-surfel-anych
+pip install --no-build-isolation submodules/diff-gaussian-rasterization
 
 pip install --no-build-isolation git+https://github.com/NVlabs/nvdiffrast
 ```
