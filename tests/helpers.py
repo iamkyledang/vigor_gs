@@ -15,7 +15,7 @@ def look_at_camera(eye, target, up=(0.0, -1.0, 0.0), fov_deg=60.0, width=96, hei
     target = np.asarray(target, dtype=np.float64)
     forward = target - eye
     forward /= np.linalg.norm(forward)
-    right = np.cross(forward, -np.asarray(up, dtype=np.float64))
+    right = np.cross(-np.asarray(up, dtype=np.float64), forward)  # x = y (down) cross z (forward)
     right /= np.linalg.norm(right)
     down = np.cross(forward, right)
 
@@ -30,6 +30,18 @@ def look_at_camera(eye, target, up=(0.0, -1.0, 0.0), fov_deg=60.0, width=96, hei
     projection = getProjectionMatrix(znear=znear, zfar=zfar, fovX=fovx, fovY=fovy).transpose(0, 1).cuda()
     full_proj = world_view.unsqueeze(0).bmm(projection.unsqueeze(0)).squeeze(0)
     return MiniCam(width, height, fovy, fovx, znear, zfar, world_view, full_proj)
+
+
+def parse_interface_args(argv):
+    """Parse a train_interface.py command line into (dataset, opt, pipe)."""
+    from argparse import ArgumentParser
+
+    from arguments import InterfaceOptimizationParams, ModelParams, PipelineParams
+
+    parser = ArgumentParser()
+    lp, op, pp = ModelParams(parser), InterfaceOptimizationParams(parser), PipelineParams(parser)
+    args = parser.parse_args(argv)
+    return lp.extract(args), op.extract(args), pp.extract(args)
 
 
 def project_points(cam, points):

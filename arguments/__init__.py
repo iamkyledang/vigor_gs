@@ -79,6 +79,11 @@ class ModelParams(ParamGroup):
         self.deform_xyz_multires = 10
         self.deform_time_multires = 6
 
+        # Fresnel blend of VIGOR-GS (utils/fresnel.py)
+        self.eta_air = 1.0
+        self.eta_glass = 1.5
+        self.optical_correction = False  # learn the small reflectance correction h_psi on top of Schlick
+
         super().__init__(parser, 'Loading Parameters', sentinel)
 
     def extract(self, args):
@@ -145,13 +150,102 @@ class OptimizationParams(ParamGroup):
         super().__init__(parser, 'Optimization Parameters')
 
 
-def get_combined_args(parser: ArgumentParser):
+class InterfaceOptimizationParams(ParamGroup):
+    """Phase I of VIGOR-GS: the interface field G_I and its deformation MLP (train_interface.py)."""
+
+    def __init__(self, parser):
+        self.iterations = 30_000
+        self.position_lr_init = 0.00016
+        self.position_lr_final = 0.0000016
+        self.position_lr_delay_mult = 0.01
+        self.position_lr_max_steps = 30_000
+        self.feature_lr = 0.0025
+        self.occupancy_lr = 0.05
+        self.opacity_lr = 0.05
+        self.scaling_lr = 0.005
+        self.rotation_lr = 0.001
+
+        # L_I = L_rgb(B_t, I_clean) + lambda_s * L_surf + mask and occupancy terms
+        self.lambda_dssim = 0.2  # 0 gives the plain L1 of the framework document
+        self.norm_loss_weight = 0.05  # L_surf: normal consistency of the surface pass
+        self.norm_loss_from_iter = 700
+        self.dist_loss_weight = 0.0  # L_surf: depth distortion of the volume pass
+        self.dist_loss_from_iter = 0
+        self.mask_loss_weight = 0.01  # BCE between the rendered glass map and the glass mask M_t
+        self.occupancy_decay_weight = 0.001
+        self.reg_from_iter = 700  # the mask and occupancy terms start here, once a coarse scene exists
+
+        self.percent_dense = 0.01
+        self.occupancy_cull = 0.05
+        self.densification_interval = 100
+        self.occupancy_reset_interval = 3000
+        self.densify_from_iter = 500
+        self.densify_until_iter = 15_000
+        self.densify_grad_threshold = 0.0002
+
+        # Interface deformation MLP D_phi_I
+        self.warm_up = 3000  # iterations trained as a static field before the deformation is switched on
+        self.deform_lr_max_steps = 40_000
+        self.time_noise_scale = 0.1  # timestamp jitter, in frame intervals, annealed to 0 (0 disables it)
+        self.time_noise_until_iter = 20_000
+        self.lambda_deform_reg = 0.0  # penalty on |d_xyz|, to keep the interface (and the glass) stable
+        super().__init__(parser, 'Interface Optimization Parameters')
+
+
+class ReflectionOptimizationParams(ParamGroup):
+    """Phase II of VIGOR-GS: the reflection field G_R and its deformation MLP (train_reflection.py)."""
+
+    def __init__(self, parser):
+        self.iterations = 30_000
+        self.position_lr_init = 0.00016
+        self.position_lr_final = 0.0000016
+        self.position_lr_delay_mult = 0.01
+        self.position_lr_max_steps = 30_000
+        self.feature_lr = 0.0025
+        self.opacity_lr = 0.05
+        self.scaling_lr = 0.005
+        self.rotation_lr = 0.001
+
+        # L_R = L_rgb(I_hat_t, I_t) + lambda_m * L_motion + lambda_o * L_opt
+        self.lambda_dssim = 0.2  # 0 gives the plain L1 of the framework document
+        self.lambda_motion = 0.01  # L_motion: mean |d_xyz| of the reflection deformation
+        self.lambda_opt = 0.01  # L_opt: mean h_psi^2, only with --optical_correction
+        self.optical_lr = 0.001
+        self.gt_glass_mask = False  # gate alpha with the ground-truth glass mask instead of the rendered glass map
+
+        # G_R has no SfM points: it starts from random points on the camera side of the glass
+        self.refl_init_points = 100_000
+        self.refl_init_radius_scale = 3.0  # radius of the initial ball, in units of the camera extent
+        self.refl_init_color = 0.5
+
+        self.percent_dense = 0.01
+        self.min_opacity = 0.005
+        self.densification_interval = 100
+        self.opacity_reset_interval = 3000
+        self.densify_from_iter = 500
+        self.densify_until_iter = 15_000
+        self.densify_grad_threshold = 0.0002
+
+        # Reflection deformation MLP D_phi_R
+        self.warm_up = 3000
+        self.deform_lr_max_steps = 40_000
+        self.time_noise_scale = 0.1
+        self.time_noise_until_iter = 20_000
+        super().__init__(parser, 'Reflection Optimization Parameters')
+
+
+def get_combined_args(parser: ArgumentParser, cfg_subdir: str = ''):
+    """
+    Command-line arguments merged over the cfg_args saved at training time.
+
+    cfg_subdir: folder below the model path that holds cfg_args (VIGOR-GS keeps one per phase, e.g. 'interface').
+    """
     cmdlne_string = sys.argv[1:]
     cfgfile_string = 'Namespace()'
     args_cmdline = parser.parse_args(cmdlne_string)
 
     try:
-        cfgfilepath = os.path.join(args_cmdline.model_path, 'cfg_args')
+        cfgfilepath = os.path.join(args_cmdline.model_path, cfg_subdir, 'cfg_args')
         print('Looking for config file in', cfgfilepath)
         with open(cfgfilepath) as cfg_file:
             print('Config file found: {}'.format(cfgfilepath))

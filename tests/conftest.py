@@ -32,3 +32,26 @@ def scene_dir():
 @pytest.fixture(autouse=True)
 def _seed():
     torch.manual_seed(0)
+
+
+@pytest.fixture(scope='session')
+def trained_interface(scene_dir, tmp_path_factory):
+    """
+    A short Phase I run on the dev scene, shared by every test that needs a trained interface.
+
+    400 iterations at 1/8 resolution with a small deformation MLP: 200 static warm-up iterations, then the
+    deformation switches on. Tests that use this must be marked `gpu` and `data`.
+    """
+    from argparse import Namespace
+
+    from tests.helpers import parse_interface_args
+    from train_interface import training
+
+    root = tmp_path_factory.mktemp('model')
+    dataset, opt, pipe = parse_interface_args(
+        ['-s', scene_dir, '-m', str(root), '-r', '8', '--eval', '--clean_fallback_original', '--deform_depth', '4', '--deform_width', '64']
+        + ['--iterations', '400', '--warm_up', '200', '--reg_from_iter', '100', '--norm_loss_from_iter', '100', '--densify_from_iter', '100']
+    )
+    dataset.linear_rgb = True
+    history = training(dataset, opt, pipe, testing_iterations=[1, 400], saving_iterations=[400])
+    return Namespace(dataset=dataset, opt=opt, pipe=pipe, history=history, root=root, iterations=400)
