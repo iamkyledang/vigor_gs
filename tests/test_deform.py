@@ -38,6 +38,13 @@ def test_output_shapes(scale_dim):
     assert d_scaling.shape == (50, scale_dim)
 
 
+@pytest.mark.parametrize('depth', [1, 2, 3, 8])
+def test_any_depth_builds_a_consistent_network(depth):
+    network = DeformNetwork(scale_dim=3, depth=depth, width=16)
+    assert len(network.linear) == depth
+    assert network(torch.rand(5, 3), torch.rand(5, 1))[0].shape == (5, 3)
+
+
 def test_fresh_network_is_the_identity():
     model = small_model(scale_dim=2)
     xyz = torch.rand(20, 3) * 4 - 2

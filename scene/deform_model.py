@@ -41,7 +41,7 @@ class DeformNetwork(nn.Module):
         """
         super().__init__()
         self.scale_dim = scale_dim
-        self.skips = [depth // 2]
+        self.skips = [depth // 2] if depth // 2 < depth - 1 else []  # never after the last layer
 
         self.embed_xyz = PositionalEncoding(3, xyz_multires)
         self.embed_time = PositionalEncoding(1, time_multires)
