@@ -49,6 +49,7 @@ python render_vigor.py -m output/scene_1           # --skip_train to render the 
 python metrics.py -m output/scene_1
 ```
 
+- `notebooks/colab_vsgd_0758.ipynb` runs this pipeline on Colab for VSGD `0758` (full model + the five ablations, results on Google Drive, resumable via `.done_<step>` files). It clones this branch with a GitHub token from the Colab Secret `GITHUB_TOKEN`, extracts only `colmap/` from `MyDrive/0758.zip`, and reuses `full`'s Phase I and glass plane for the three Phase-II-only ablations.
 - On the 4 GB GPU use `-r 4`, a small deformation MLP (`--deform_width 64 --deform_depth 4`) and a few thousand iterations; the defaults are 30,000 iterations per phase.
 - Scene settings (`-s`, `-r`, `--eval`, deformation sizes, `--linear_rgb`) are given once to `train_interface.py`. Later steps read them from `<model>/interface/cfg_args`, and `render_vigor.py` from `<model>/reflection/cfg_args`.
 - `train_interface.py` trains on linear RGB unless `--srgb` is passed; saved images are converted back to sRGB.
