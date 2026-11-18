@@ -4,7 +4,8 @@ VIGOR-GS: bring the glass masks and clean images of a scene onto the undistorted
 Masks (frames.json 'source_mask') and clean images (<scene>/clean_image/<split>/images/) are made on the source
 images <scene>/<split>/images/, which for VSGD and Wayve are the distorted originals. COLMAP's undistorted images
 differ in size and geometry, and the distorted camera model was not kept. For every COLMAP camera this script fits
-that model from SIFT matches between source and COLMAP images (utils/undistort_utils.py), checks that the warped
+that model from SIFT matches between source and COLMAP images (utils/undistort_utils.py; radial for mildly distorted
+lenses such as VSGD, fisheye for wide-angle ones such as WayveScenes101, chosen automatically), checks that the warped
 source images line up with the COLMAP images, and writes:
 
     <out>/colmap/masks/<stem>.png                         undistorted glass masks (read first by readVigorSceneInfo)
@@ -29,7 +30,7 @@ from PIL import Image
 
 from scene.colmap_loader import read_extrinsics_binary, read_intrinsics_binary
 from scene.dataset_readers import _find_clean_image
-from utils.undistort_utils import PARAM_NAMES, build_remap, fit_distortion, local_shifts, match_points, psnr, warp
+from utils.undistort_utils import MODELS, build_remap, fit_distortion, local_shifts, match_points, psnr, warp
 
 
 def undistorted_camera(intr):
@@ -94,7 +95,7 @@ def main():
     parser.add_argument('--fit_frames', type=int, default=10, help='frames per camera used to fit the distortion')
     parser.add_argument('--check_frames', type=int, default=6, help='frames per camera used to check the alignment')
     parser.add_argument('--max_residual', type=float, default=1.0, help='refuse to write when the median match residual (px) is larger')
-    parser.add_argument('--no_k2', action='store_true', help='fit SIMPLE_RADIAL (k1 only) instead of RADIAL (k1, k2)')
+    parser.add_argument('--model', default='auto', choices=['auto', *MODELS], help='distortion model; auto fits each one and keeps the best (radial for mild lenses, fisheye for wide-angle ones)')
     parser.add_argument('--preview', type=int, default=3, help='mask overlays to save per camera (0 for none)')
     parser.add_argument('--overwrite', action='store_true', help='replace existing output files')
     args = parser.parse_args()
@@ -136,7 +137,7 @@ def main():
     if existing and not args.overwrite:
         sys.exit(f'{len(existing)} output files already exist, e.g. {existing[0]}. Pass --overwrite to replace them.')
 
-    report = {'scene': scene, 'model': 'RADIAL' if not args.no_k2 else 'SIMPLE_RADIAL', 'convention': 'COLMAP pixel centers at +0.5', 'cameras': {}}
+    report = {'scene': scene, 'convention': 'COLMAP pixel centers at +0.5', 'cameras': {}}
     maps_of = {}
     for camera_id, names in sorted(by_camera.items()):
         names = sorted(names)
@@ -149,8 +150,24 @@ def main():
             undist_pts.append(pc)
             source_pts.append(ps)
         undist_pts, source_pts = np.concatenate(undist_pts), np.concatenate(source_pts)
-        params, dist = fit_distortion(undist_pts, source_pts, undistorted, source_size, fit_k2=not args.no_k2)
-        maps = build_remap(undistorted, params)
+        fits = {}
+        for model in MODELS if args.model == 'auto' else [args.model]:
+            try:
+                fits[model] = fit_distortion(undist_pts, source_pts, undistorted, source_size, model)
+            except ValueError as e:
+                print(f'[camera {camera_id}] {model}: {e}')
+        if not fits:
+            sys.exit(f'Camera {camera_id}: no distortion model fits the matches; nothing written.')
+        # The simpler radial model, unless a later (more flexible) model lowers the median residual by more than 10%.
+        def median_residual(m):
+            return float(np.median(fits[m][1][fits[m][1] < 3.0]))
+
+        model = next(iter(fits))
+        for other in list(fits)[1:]:
+            if median_residual(other) < 0.9 * median_residual(model):
+                model = other
+        params, dist = fits[model]
+        maps = build_remap(undistorted, params, model)
         maps_of[camera_id] = maps
 
         inside = (maps[0] >= -0.5) & (maps[0] <= source_size[0] - 0.5) & (maps[1] >= -0.5) & (maps[1] <= source_size[1] - 0.5)
@@ -158,7 +175,9 @@ def main():
         entry = {
             'undistorted': undistorted,
             'source_size': list(source_size),
-            'params': dict(zip(PARAM_NAMES, map(float, params))),
+            'model': model,
+            'params': dict(zip(MODELS[model], map(float, params))),
+            'other_models': {m: {'inliers_3px': int((d < 3.0).sum()), 'residual_median_px': float(np.median(d[d < 3.0]))} for m, (_, d) in fits.items() if m != model},
             'matches': int(len(dist)),
             'inliers_3px': int((dist < 3.0).sum()),
             'residual_median_px': float(np.median(dist[dist < 3.0])),
@@ -172,7 +191,9 @@ def main():
         print(
             f'[camera {camera_id}] {len(names)} frames, {entry["inliers_3px"]}/{entry["matches"]} matches within 3 px, residual median {entry["residual_median_px"]:.3f} px, p95 {entry["residual_p95_px"]:.3f} px'
         )
-        print(f'    f={p["f"]:.2f} cx={p["cx"]:.2f} cy={p["cy"]:.2f} k1={p["k1"]:+.5f} k2={p["k2"]:+.5f}; {100 * entry["outside_source_fraction"]:.2f}% of COLMAP pixels fall outside the source image')
+        print(f'    model {model}: ' + ' '.join(f'{k}={v:.5g}' for k, v in p.items()) + f'; {100 * entry["outside_source_fraction"]:.2f}% of COLMAP pixels fall outside the source image')
+        for m, o in entry['other_models'].items():
+            print(f'    ({m}: {o["inliers_3px"]} matches within 3 px, residual median {o["residual_median_px"]:.3f} px)')
         for c in checks:
             print(f'    {c["name"]}: PSNR resize {c["psnr_resize"]:.2f} -> warp {c["psnr_warp"]:.2f} dB, max shift {c["max_shift_resize_px"]:.2f} -> {c["max_shift_warp_px"]:.2f} px')
         if entry['residual_median_px'] > args.max_residual:

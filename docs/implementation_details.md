@@ -129,15 +129,20 @@ Công thức sRGB → linear cho đoạn phi tuyến là `((x + 0.055) / 1.055)^
 
 Mask và ảnh clean được làm trên ảnh nguồn `<scene>/<split>/images/`. Với VSGD (và Wayve), đây là ảnh gốc còn méo, trong khi ảnh COLMAP đã qua `image_undistorter`, có kích thước khác (0758: 1920×1080 → 1927×1080) và hình học khác. `colmap/` chỉ giữ model PINHOLE sau undistort; model camera méo ban đầu không còn. Script này dựng lại phép warp đó cho từng camera COLMAP:
 
-1. **Ghép điểm.** Trên `--fit_frames` frame rải đều (mặc định 10), lấy SIFT của ảnh nguồn và ảnh COLMAP, ghép theo ratio test 0.75, rồi bỏ cặp nào lệch quá 40 px sau khi bù tỉ lệ kích thước (phép undistort chỉ dời điểm vài pixel).
-2. **Fit model méo xuyên tâm** `(f, cx, cy, k1, k2)` theo đúng quy ước của COLMAP (`WarpImageBetweenCameras`: tâm pixel ở `+0.5`):
-   `x = (u' − cx')/fx'`, `s = 1 + k1·r² + k2·r⁴`, `u = f·s·x + cx`. Phía undistort `(fx', fy', cx', cy')` đọc từ `cameras.bin`. `least_squares` chạy một lượt soft-L1, bỏ các cặp lệch quá 3 px, rồi fit lại. `--no_k2` cho model SIMPLE_RADIAL.
+1. **Ghép điểm.** Trên `--fit_frames` frame rải đều (mặc định 10), lấy SIFT của ảnh nguồn và ảnh COLMAP, ghép theo ratio test 0.75. Không lọc theo khoảng cách, vì với ống kính góc rộng (Wayve) một điểm có thể dời hàng trăm pixel.
+2. **Fit model camera méo** theo đúng quy ước của COLMAP (`WarpImageBetweenCameras`: tâm pixel ở `+0.5`). Điểm undistort `x = (u' − cx')/fx'`, `y = (v' − cy')/fy'`, `r = √(x² + y²)` rơi vào điểm nguồn `u = fx·s·x + cx`, `v = fy·s·y + cy`, với hai model:
+   - `radial` `(fx, fy, cx, cy, k1, k2)`: `s = 1 + k1·r² + k2·r⁴`, cho ống kính méo nhẹ (VSGD).
+   - `fisheye` `(fx, fy, cx, cy, k1..k4)`, như OPENCV_FISHEYE của COLMAP: `θ = atan(r)`, `s = θ·(1 + k1θ² + k2θ⁴ + k3θ⁶ + k4θ⁸)/r`, cho ống kính góc rộng (Wayve, FOV ngang ~120°).
+
+   Phía undistort `(fx', fy', cx', cy')` đọc từ `cameras.bin`. Fit đi từ thô đến tinh: mỗi bước là một lần `least_squares` soft-L1, rồi chỉ giữ các cặp lệch dưới 30 → 8 → 3 → 3 px cho bước sau; thử ba tiêu cự khởi đầu (1, 0.7, 1.4 lần `fx'`) và giữ lần có nhiều cặp dưới 3 px nhất. `--model auto` (mặc định) fit cả hai model và giữ `radial`, trừ khi `fisheye` giảm sai số median hơn 10%.
 3. **Kiểm chứng** trên `--check_frames` frame khác: PSNR và độ dời cục bộ (phase correlation trên lưới 3×3 patch) giữa ảnh nguồn đã warp và ảnh COLMAP, so với cách chỉ resize. Median residual vượt `--max_residual` (mặc định 1 px) thì dừng, không ghi gì.
 4. **Ghi**: mask warp bằng nearest (giữ nguyên các giá trị nhãn), ảnh clean warp bằng bilinear (giống COLMAP). Kết quả ở `<out>/colmap/masks/<stem>.png` (reader đọc trước `source_mask`) và `<out>/colmap/<clean_images>/<split>/images/<stem>.png` (reader dùng thay `<scene>/<clean_images>/` khi thư mục này tồn tại). Tham số và số đo ghi vào `colmap/source_warp.json`; `--preview N` lưu ảnh COLMAP có viền mask resize (đỏ) và warp (xanh). Mọi file đích được liệt kê trước; có file đã tồn tại mà thiếu `--overwrite` thì dừng.
 
 `--out` mặc định là chính scene. Nên ghi ra thư mục khác trước để xem, rồi chạy lại vào scene với `--preview 0`.
 
 Kết quả trên VSGD (2026-11-18): cả sáu scene có median residual 0.15–0.17 px; `f` khớp `fx'` của ảnh COLMAP và `(cx, cy) = (960, 540)`, đúng như mặc định của COLMAP. PSNR giữa ảnh nguồn đã warp và ảnh COLMAP tăng từ 33–41 dB (chỉ resize) lên 45–49 dB, riêng `0936` từ 20–24 dB lên 39–46 dB. Độ dời lớn nhất giảm từ 1–2 px (`0936`: 7–8 px) xuống dưới 0.25 px. Với ảnh clean của `0758`, ở vùng ngoài kính PSNR so với ảnh COLMAP tăng từ 38–40 dB lên khoảng 46.5 dB.
+
+Kết quả trên WayveScene101 (2026-11-18, bảy scene, chỉ có mask): model `fisheye` được chọn ở mọi scene, sai số median 0.24–0.30 px (`radial` cho 0.54–0.76 px). `fx, fy` fit ra khớp `fx', fy'` của ảnh COLMAP và `fx ≠ fy` (chênh tới 0.7%). Chỉ resize thì mask lệch 50–500 px; sau warp, độ dời lớn nhất còn 0.13–0.46 px, riêng `scene_001` khoảng 1 px. PSNR giữa ảnh nguồn đã warp và ảnh COLMAP là 31–39 dB (thấp hơn VSGD vì rìa ảnh bị kéo giãn mạnh khi duỗi fisheye).
 
 ## 4. Tham số dòng lệnh
 

@@ -116,7 +116,7 @@ Ba bộ trong `data/datasets/datasets/` cùng một layout (`colmap/`, `train/`,
 |---|---|---|---|
 | 3D-FRONT-T | 960×540, PINHOLE | 960×540, khớp ảnh | Dùng được ngay. `scene_1`: 137 train / 34 test |
 | VSGD | 1927×1080 (đã undistort) | 1920×1080 (ảnh gốc) | Mask lệch so với ảnh COLMAP |
-| WayveScene101 | 3271×1224 (đã undistort) | 1920×1080 | Mask là mask privacy/validity, không phải mask kính |
+| WayveScene101 | ~3270×1224 (fisheye đã duỗi phẳng, FOV ngang ~120°) | 1920×1080 (ảnh fisheye gốc) | `preprocess.json` gọi là mask privacy/validity, nhưng nhìn ảnh thì mask đánh dấu cửa sổ, cửa kính, mặt tiền cửa hàng; khá thô, trùm cả cửa cuốn kim loại, tường giữa các cửa sổ và hàng rào lưới |
 
 - **Ảnh clean** (đã loại reflection) nằm ở `<scene>/clean_image/<split>/images/<stem>.png`, lặp lại layout `<scene>/<split>/images/` (kèm `clean_image/<split>/masks/`, giống hệt mask gốc; `clean.zip` là bản nén của cùng dữ liệu, có thêm biên nhận xử lý trong `_reflection_removal/`). Hiện mới có VSGD `0758`. Ảnh clean làm từ ảnh nguồn, nên ở VSGD nó có kích thước ảnh gốc 1920×1080 và lệch với ảnh COLMAP đã undistort giống như mask (xem bảng trên).
 - `glint/diffrens/` có `basecolor`, `diffuse_albedo`, `depth`, `normal` nhưng chỉ cho frame train, và đó là albedo chứ không phải ảnh đã loại reflection.
@@ -236,5 +236,5 @@ Vì vậy lượt chạy này chỉ xác nhận pipeline đúng về mặt kỹ 
 1. **Cung cấp ảnh clean cho các scene còn lại** vào `<scene>/clean_image/<split>/images/<stem>.png` (đã có VSGD `0758`). Đây là điều kiện để đánh giá được Phase II.
 2. **Chọn hướng cho scene nhiều mặt kính**: mở rộng sang nhiều plane, hoặc đánh giá trên scene có một tấm kính phẳng.
 3. **Chạy đủ dài trên máy mạnh hơn**, ở độ phân giải đầy đủ, rồi chạy năm ablation, mỗi cái một thư mục `-m` riêng.
-4. **Chạy `undistort_sources.py` cho mỗi scene mới có ảnh clean** (VSGD đã xong). Tìm mask kính cho WayveScene101; script chưa được thử trên Wayve (rig nhiều camera, ảnh 3271×1224 so với nguồn 1920×1080, có thể cần model méo khác).
+4. **Chạy `undistort_sources.py` cho mỗi scene mới có ảnh clean** (VSGD và mask của WayveScene101 đã xong; Wayve cần model `fisheye`, script tự chọn). Mask Wayve thô và trùm cả vật không phải kính (cửa cuốn, hàng rào); cân nhắc làm lại mask kính nếu Wayve được dùng để đánh giá.
 5. **Tinh chỉnh Phase II** theo mục 6.3: mức α, ngưỡng densify, khởi tạo `G_R`, `λ_motion`, `λ_opt`.
