@@ -90,6 +90,18 @@ def test_normalize_and_save_load_round_trip(tmp_path):
     assert record['source'] == 'manual' and record['inlier_ratio'] == 0.9
 
 
+def test_save_plane_accepts_numpy_and_torch_scalars(tmp_path):
+    """numpy 2 (Colab) keeps np.float32 * float as float32, e.g. the RANSAC threshold built from cameras_extent."""
+    import numpy as np
+
+    path = str(tmp_path / 'glass_plane.json')
+    save_plane(path, torch.tensor([0.0, 0.0, 1.0]), torch.tensor(0.5), threshold=np.float32(0.01) * 3.0, num_points=np.int64(7), rmse=torch.tensor(0.002), extent=np.array([1.0, 2.0]))
+    _, offset, record = load_plane(path, device='cpu')
+    assert offset == pytest.approx(0.5)
+    assert record['threshold'] == pytest.approx(0.03) and record['num_points'] == 7
+    assert record['rmse'] == pytest.approx(0.002) and record['extent'] == [1.0, 2.0]
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # Extraction from an interface field
 

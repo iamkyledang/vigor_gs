@@ -83,11 +83,18 @@ def normalize_plane(normal, offset):
     return normal / norm, offset / norm
 
 
+def _json_default(value):
+    """numpy / torch scalars and arrays -> Python numbers and lists (numpy 2 keeps float32 results, which json rejects)."""
+    if hasattr(value, 'tolist'):
+        return value.tolist()
+    raise TypeError(f'Object of type {type(value).__name__} is not JSON serializable')
+
+
 def save_plane(path, normal, offset, **info):
     record = {'normal': [float(v) for v in normal], 'offset': float(offset)}
     record.update(info)
     with open(path, 'w') as f:
-        json.dump(record, f, indent=2)
+        json.dump(record, f, indent=2, default=_json_default)
 
 
 def load_plane(path, device='cuda'):
