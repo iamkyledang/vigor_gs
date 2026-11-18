@@ -10,7 +10,7 @@ Tài liệu này mô tả code VIGOR-GS trên nhánh `viet_huynh`: mỗi file l�
 
 1. [Bức tranh chung](#1-bức-tranh-chung)
 2. [Quy ước dùng xuyên suốt](#2-quy-ước-dùng-xuyên-suốt)
-3. [Dữ liệu: reader, camera, màu](#3-dữ-liệu-reader-camera-màu)
+3. [Dữ liệu: reader, camera, màu, undistort mask và ảnh clean](#3-dữ-liệu-reader-camera-màu)
 4. [Tham số dòng lệnh](#4-tham-số-dòng-lệnh)
 5. [Deformation MLP](#5-deformation-mlp)
 6. [Lớp nền `GaussianField`](#6-lớp-nền-gaussianfield)
@@ -100,7 +100,7 @@ Reader làm theo thứ tự sau:
    - **Bỏ qua ảnh không có trong `split.json`.** Model COLMAP của Wayve chứa ảnh của mọi camera trên rig (khoảng 1000 ảnh), trong khi scene chỉ dùng một phần.
    - Lấy FoV từ intrinsics. Chỉ nhận `PINHOLE` và `SIMPLE_PINHOLE`; model khác báo lỗi ngay thay vì cho ra hình học sai mà không ai hay.
    - Tìm mask ở `colmap/masks/<stem>.png`, nếu không có thì thử đường dẫn `source_mask` trong `frames.json`. Không có mask nào thì báo lỗi. Mask lệch kích thước với ảnh thì được đếm lại, cuối cùng in một cảnh báo.
-   - Tìm ảnh clean (`_find_clean_image`) dưới gốc `<scene>/<clean_images>/` (mặc định `clean_image`), với các đuôi `.png/.jpg/.jpeg`, theo thứ tự: thư mục lặp lại `source_image` của frame (ví dụ `clean_image/train/images/<stem>.png` cho `source_image = train/images/<stem>.jpg`), rồi `<split>/images/`, rồi chính thư mục gốc (layout phẳng). Quy tắc chỉ dựa vào `frames.json` và `split.json`, nên dùng chung cho mọi bộ dữ liệu. Thiếu thì ghi tên vào danh sách `missing_clean`. Ảnh clean lệch kích thước với ảnh COLMAP (VSGD: 1920×1080 so với ảnh đã undistort) được đếm và báo một cảnh báo; `loadCam` chỉ resize, không undistort.
+   - Tìm ảnh clean (`_find_clean_image`) dưới gốc `<scene>/<clean_images>/` (mặc định `clean_image`), với các đuôi `.png/.jpg/.jpeg`, theo thứ tự: thư mục lặp lại `source_image` của frame (ví dụ `clean_image/train/images/<stem>.png` cho `source_image = train/images/<stem>.jpg`), rồi `<split>/images/`, rồi chính thư mục gốc (layout phẳng). Quy tắc chỉ dựa vào `frames.json` và `split.json`, nên dùng chung cho mọi bộ dữ liệu. Thiếu thì ghi tên vào danh sách `missing_clean`. Nếu `<scene>/colmap/<clean_images>/` tồn tại (bản đã undistort do `undistort_sources.py` ghi, mục 3.4) thì gốc này được dùng thay cho `<scene>/<clean_images>/`. Ảnh clean lệch kích thước với ảnh COLMAP (VSGD trước khi undistort: 1920×1080 so với ảnh đã undistort) được đếm và báo một cảnh báo; `loadCam` chỉ resize, không undistort.
 4. Sau vòng lặp: nếu còn ảnh thiếu bản clean mà không bật `--clean_fallback_original` thì báo lỗi, kèm số ảnh thiếu và tên một ảnh làm ví dụ. Bật cờ thì chỉ in cảnh báo.
 5. Chia train/test theo `split.json` (thay cho `llffhold` của reader COLMAP). Không có `--eval` thì mọi ảnh đều vào train.
 6. Point cloud khởi tạo lấy từ `points3D.bin`, chuyển sang `.ply` ở lần đọc đầu tiên.
@@ -124,6 +124,20 @@ Reader làm theo thứ tự sau:
 Công thức sRGB → linear cho đoạn phi tuyến là `((x + 0.055) / 1.055)^2.4`. Code gốc thiếu dấu ngoặc nên tính `(x + 0.055/1.055)^2.4`, cho giá trị lớn hơn 1 khi `x` gần 1. Baseline không gọi hàm này nên lỗi chưa từng lộ ra; test `test_srgb_linear_conversions_are_inverse` phát hiện nó. Code mới chỉ thêm dấu ngoặc.
 
 ---
+
+### 3.4. Đưa mask và ảnh clean về lưới ảnh COLMAP: `undistort_sources.py` ([utils/undistort_utils.py](../utils/undistort_utils.py))
+
+Mask và ảnh clean được làm trên ảnh nguồn `<scene>/<split>/images/`. Với VSGD (và Wayve), đây là ảnh gốc còn méo, trong khi ảnh COLMAP đã qua `image_undistorter`, có kích thước khác (0758: 1920×1080 → 1927×1080) và hình học khác. `colmap/` chỉ giữ model PINHOLE sau undistort; model camera méo ban đầu không còn. Script này dựng lại phép warp đó cho từng camera COLMAP:
+
+1. **Ghép điểm.** Trên `--fit_frames` frame rải đều (mặc định 10), lấy SIFT của ảnh nguồn và ảnh COLMAP, ghép theo ratio test 0.75, rồi bỏ cặp nào lệch quá 40 px sau khi bù tỉ lệ kích thước (phép undistort chỉ dời điểm vài pixel).
+2. **Fit model méo xuyên tâm** `(f, cx, cy, k1, k2)` theo đúng quy ước của COLMAP (`WarpImageBetweenCameras`: tâm pixel ở `+0.5`):
+   `x = (u' − cx')/fx'`, `s = 1 + k1·r² + k2·r⁴`, `u = f·s·x + cx`. Phía undistort `(fx', fy', cx', cy')` đọc từ `cameras.bin`. `least_squares` chạy một lượt soft-L1, bỏ các cặp lệch quá 3 px, rồi fit lại. `--no_k2` cho model SIMPLE_RADIAL.
+3. **Kiểm chứng** trên `--check_frames` frame khác: PSNR và độ dời cục bộ (phase correlation trên lưới 3×3 patch) giữa ảnh nguồn đã warp và ảnh COLMAP, so với cách chỉ resize. Median residual vượt `--max_residual` (mặc định 1 px) thì dừng, không ghi gì.
+4. **Ghi**: mask warp bằng nearest (giữ nguyên các giá trị nhãn), ảnh clean warp bằng bilinear (giống COLMAP). Kết quả ở `<out>/colmap/masks/<stem>.png` (reader đọc trước `source_mask`) và `<out>/colmap/<clean_images>/<split>/images/<stem>.png` (reader dùng thay `<scene>/<clean_images>/` khi thư mục này tồn tại). Tham số và số đo ghi vào `colmap/source_warp.json`; `--preview N` lưu ảnh COLMAP có viền mask resize (đỏ) và warp (xanh). Mọi file đích được liệt kê trước; có file đã tồn tại mà thiếu `--overwrite` thì dừng.
+
+`--out` mặc định là chính scene. Nên ghi ra thư mục khác trước để xem, rồi chạy lại vào scene với `--preview 0`.
+
+Kết quả trên VSGD (2026-11-18): cả sáu scene có median residual 0.15–0.17 px; `f` khớp `fx'` của ảnh COLMAP và `(cx, cy) = (960, 540)`, đúng như mặc định của COLMAP. PSNR giữa ảnh nguồn đã warp và ảnh COLMAP tăng từ 33–41 dB (chỉ resize) lên 45–49 dB, riêng `0936` từ 20–24 dB lên 39–46 dB. Độ dời lớn nhất giảm từ 1–2 px (`0936`: 7–8 px) xuống dưới 0.25 px. Với ảnh clean của `0758`, ở vùng ngoài kính PSNR so với ảnh COLMAP tăng từ 38–40 dB lên khoảng 46.5 dB.
 
 ## 4. Tham số dòng lệnh
 
@@ -645,7 +659,8 @@ Chạy bằng `python -m pytest` trong WSL (lệnh đầy đủ ở `CLAUDE.md`)
 |---|---|
 | `test_env.py` | CUDA và các extension import được; rasterizer 2DGS chạy |
 | `test_data.py` | Split theo `split.json`; `time` chuẩn hoá và tăng dần; mask khớp kích thước; thiếu ảnh clean thì báo lỗi, có cờ fallback thì dùng ảnh gốc; ảnh clean theo layout `<split>/images/` khác kích thước vẫn được tìm và resize; `linear_rgb` đổi cả hai ảnh đích; sRGB↔linear là nghịch đảo của nhau; `Scene` nhận ra layout VIGOR |
-| `test_clean_lookup.py` | Thứ tự tìm ảnh clean: thư mục lặp lại `source_image` (đuôi bất kỳ), rồi `<split>/images/`, rồi thư mục phẳng; không lấy nhầm ảnh của split kia. Không cần GPU hay dữ liệu |
+| `test_clean_lookup.py` | Thứ tự tìm ảnh clean: thư mục lặp lại `source_image` (đuôi bất kỳ), rồi `<split>/images/`, rồi thư mục phẳng; không lấy nhầm ảnh của split kia; reader ưu tiên `colmap/clean_image/` |
+| `test_undistort.py` | Không méo thì tâm ảnh giữ nguyên; fit khôi phục model dù có 7% cặp ghép sai; điểm ngẫu nhiên thì báo lỗi; remap khớp `distort_points` và nearest giữ nhãn mask; ghép SIFT + fit tìm lại được một phép undistort tổng hợp (lệch < 0.2 px, trong khi resize lệch > 1 px). Không cần GPU hay dữ liệu |
 | `test_deform.py` | Layout positional encoding; shape đầu ra với `scale_dim` 2 và 3; mọi `depth` đều dựng được mạng; mạng mới là phép đồng nhất; quaternion vẫn chuẩn hoá và scale vẫn dương sau deform; đầu ra phụ thuộc cả `t` lẫn `x`; gradient tới mọi lớp nhưng không tới tâm canonical; nhiễu thời gian; lr giảm dần; save/load; freeze |
 | `test_interface.py` | Đủ key và shape; gradient tới mọi tham số và tới MLP; `p` và `o` đóng vai trò riêng; offset 0 trùng render canonical; offset tịnh tiến bằng dời Gaussian; PLY round-trip; densify/prune giữ tham số và optimizer đồng bộ; prune theo `p` và tha đĩa chưa được nhìn thấy; reset kẹp đúng giá trị; capture/restore; freeze |
 | `test_train_interface.py` | Nhiễu thời gian giảm về 0; các thành phần loss bật đúng lịch; `L_rgb` so với ảnh clean; mask loss đẩy `o` đúng chiều; một lần train ngắn làm PSNR tăng và lưu đủ file |

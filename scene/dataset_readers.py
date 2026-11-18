@@ -355,7 +355,9 @@ def readVigorSceneInfo(path, eval, clean_images='clean_image', clean_fallback_or
         <scene>/colmap/split.json           {'train': [names], 'test': [names]}
         <scene>/colmap/masks/<stem>.png     glass masks M_t (or the frame's 'source_mask' path)
         <scene>/<clean_images>/...          reflection-removed targets I_t^clean (see _find_clean_image), by default
-                                            <scene>/clean_image/<split>/images/<stem>.png, mirroring <scene>/<split>/images/
+                                            <scene>/clean_image/<split>/images/<stem>.png, mirroring <scene>/<split>/images/;
+                                            <scene>/colmap/<clean_images>/ is used instead when it exists (written by
+                                            undistort_sources.py, aligned with the COLMAP images)
 
     `clean_images` may be absolute or relative to the scene folder. A missing clean image is an error unless
     `clean_fallback_original` is set, in which case the original image stands in for it. `ignore_clean_images`
@@ -364,11 +366,15 @@ def readVigorSceneInfo(path, eval, clean_images='clean_image', clean_fallback_or
     Clean images and masks are made from the source images (<scene>/<split>/images/), which for VSGD and Wayve are
     the distorted originals, not the undistorted COLMAP images. Where the sizes differ they are only resized to the
     COLMAP image, so they are off by a few pixels near the borders; a warning reports how many frames this affects.
+    Run undistort_sources.py once per scene to write aligned copies under colmap/.
     """
     colmap_dir = os.path.join(path, 'colmap')
     sparse_dir = os.path.join(colmap_dir, 'sparse', '0')
     images_dir = os.path.join(colmap_dir, 'images')
     clean_dir = clean_images if os.path.isabs(clean_images) else os.path.join(path, clean_images)
+    # undistort_sources.py writes clean images aligned with the COLMAP images under colmap/; prefer those.
+    if not os.path.isabs(clean_images) and os.path.isdir(os.path.join(colmap_dir, clean_images)):
+        clean_dir = os.path.join(colmap_dir, clean_images)
 
     with open(os.path.join(colmap_dir, 'frames.json')) as f:
         frames = {frame['name']: frame for frame in json.load(f)['frames']}

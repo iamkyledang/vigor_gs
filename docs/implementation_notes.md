@@ -120,7 +120,7 @@ Ba bộ trong `data/datasets/datasets/` cùng một layout (`colmap/`, `train/`,
 
 - **Ảnh clean** (đã loại reflection) nằm ở `<scene>/clean_image/<split>/images/<stem>.png`, lặp lại layout `<scene>/<split>/images/` (kèm `clean_image/<split>/masks/`, giống hệt mask gốc; `clean.zip` là bản nén của cùng dữ liệu, có thêm biên nhận xử lý trong `_reflection_removal/`). Hiện mới có VSGD `0758`. Ảnh clean làm từ ảnh nguồn, nên ở VSGD nó có kích thước ảnh gốc 1920×1080 và lệch với ảnh COLMAP đã undistort giống như mask (xem bảng trên).
 - `glint/diffrens/` có `basecolor`, `diffuse_albedo`, `depth`, `normal` nhưng chỉ cho frame train, và đó là albedo chứ không phải ảnh đã loại reflection.
-- Đo bằng phase correlation sau khi chỉ resize ảnh nguồn lên kích thước COLMAP: lệch tới khoảng 2 px ở góc ảnh với `0758` và `0807`, tới khoảng 7 px ở rìa với `0936` (độ phân giải gốc). Model camera có distortion không được lưu lại trong `colmap/`, nên chưa undistort được mask và ảnh clean.
+- Đo bằng phase correlation sau khi chỉ resize ảnh nguồn lên kích thước COLMAP: lệch tới khoảng 2 px ở góc ảnh với `0758` và `0807`, tới 7–8 px với `0936` (độ phân giải gốc). Model camera méo không được lưu trong `colmap/`, nên `undistort_sources.py` fit lại nó từ cặp ảnh nguồn / ảnh COLMAP rồi warp mask và ảnh clean vào `colmap/masks/` và `colmap/clean_image/` (chi tiết và số đo ở mục 3.4 của `implementation_details.md`). Độ lệch còn dưới 0.25 px ở cả sáu scene VSGD.
 - Tên ảnh trong `images.bin` khớp với trường `name` của `frames.json` ở cả ba bộ. Thời gian chuẩn hoá `time ∈ [0, 1]` có sẵn trong `frames.json`.
 - **Kính trong `3D-FRONT-T/scene_1` là một hộp kính** (tủ trưng bày chứa quả bóng), camera đi vòng quanh. Scene này vi phạm giả định một glass plane.
 
@@ -236,5 +236,5 @@ Vì vậy lượt chạy này chỉ xác nhận pipeline đúng về mặt kỹ 
 1. **Cung cấp ảnh clean cho các scene còn lại** vào `<scene>/clean_image/<split>/images/<stem>.png` (đã có VSGD `0758`). Đây là điều kiện để đánh giá được Phase II.
 2. **Chọn hướng cho scene nhiều mặt kính**: mở rộng sang nhiều plane, hoặc đánh giá trên scene có một tấm kính phẳng.
 3. **Chạy đủ dài trên máy mạnh hơn**, ở độ phân giải đầy đủ, rồi chạy năm ablation, mỗi cái một thư mục `-m` riêng.
-4. **Xử lý mask và ảnh clean của VSGD** (undistort cho khớp ảnh COLMAP; cần model camera có distortion, hoặc ước lượng phép warp từ cặp ảnh nguồn / ảnh COLMAP) và tìm mask kính cho WayveScene101.
+4. **Chạy `undistort_sources.py` cho mỗi scene mới có ảnh clean** (VSGD đã xong). Tìm mask kính cho WayveScene101; script chưa được thử trên Wayve (rig nhiều camera, ảnh 3271×1224 so với nguồn 1920×1080, có thể cần model méo khác).
 5. **Tinh chỉnh Phase II** theo mục 6.3: mức α, ngưỡng densify, khởi tạo `G_R`, `λ_motion`, `λ_opt`.
