@@ -74,7 +74,7 @@ class ModelParams(ParamGroup):
         self.xyz_axis = [0.0, 0.0, 0.0]
 
         # VIGOR-GS scene layout (see readVigorSceneInfo)
-        self.clean_images = 'clean'  # folder of reflection-removed targets, absolute or relative to the scene
+        self.clean_images = 'clean_image'  # root of the reflection-removed targets, absolute or relative to the scene
         self.clean_fallback_original = False  # use the original image where a clean one is missing
         self.linear_rgb = False  # convert targets from sRGB to linear RGB at load time
 

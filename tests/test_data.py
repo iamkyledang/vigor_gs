@@ -98,6 +98,24 @@ def test_camera_carries_clean_image_mask_and_time(scene_dir, clean_dir):
     assert not torch.allclose(cam.original_image, cam.clean_image)
 
 
+def test_clean_images_in_the_split_layout_are_found_and_resized(scene_dir, tmp_path):
+    """The shipped layout: <clean>/<split>/images/<stem>.png, mirroring <scene>/<split>/images/, at another size."""
+    with open(os.path.join(scene_dir, 'colmap', 'split.json')) as f:
+        split = json.load(f)
+    flat = Image.new('RGB', (100, 50), CLEAN_COLOR)
+    for split_name, names in split.items():
+        os.makedirs(tmp_path / split_name / 'images')
+        for name in names:
+            flat.save(tmp_path / split_name / 'images' / (os.path.splitext(name)[0] + '.png'))
+
+    info = readVigorSceneInfo(scene_dir, eval=True, clean_images=str(tmp_path))
+    assert all(c.clean_image is not None for c in info.train_cameras + info.test_cameras)
+    cam = loadCam(load_args(), 0, info.test_cameras[0], 1.0)
+    assert cam.clean_image.shape == cam.original_image.shape
+    expected = torch.tensor(CLEAN_COLOR, device=cam.clean_image.device).float() / 255
+    assert torch.allclose(cam.clean_image.mean(dim=(1, 2)), expected, atol=1e-3)
+
+
 def test_linear_rgb_converts_both_targets(scene_dir, clean_dir):
     info = readVigorSceneInfo(scene_dir, eval=True, clean_images=clean_dir)
     srgb = loadCam(load_args(), 0, info.train_cameras[0], 1.0)

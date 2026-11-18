@@ -324,7 +324,28 @@ def _find_by_stem(folder, stem):
     return None
 
 
-def readVigorSceneInfo(path, eval, clean_images='clean', clean_fallback_original=False, ignore_clean_images=False):
+def _find_clean_image(clean_dir, frame, split_name, stem):
+    """
+    Path of a frame's reflection-removed image under `clean_dir`, or None. Tried in order:
+
+        <clean_dir>/<dir of frame['source_image']>/<stem>.*   mirror of the source layout, e.g. train/images/<stem>.png
+        <clean_dir>/<split>/images/<stem>.*                   the same layout when the frame has no source_image
+        <clean_dir>/<stem>.*                                  a flat folder
+    """
+    folders = []
+    if frame.get('source_image'):
+        folders.append(os.path.join(clean_dir, os.path.dirname(frame['source_image'])))
+    if split_name:
+        folders.append(os.path.join(clean_dir, split_name, 'images'))
+    folders.append(clean_dir)
+    for folder in folders:
+        found = _find_by_stem(folder, stem)
+        if found is not None:
+            return found
+    return None
+
+
+def readVigorSceneInfo(path, eval, clean_images='clean_image', clean_fallback_original=False, ignore_clean_images=False):
     """
     Reader for the VIGOR-GS scene layout:
 
@@ -333,11 +354,16 @@ def readVigorSceneInfo(path, eval, clean_images='clean', clean_fallback_original
         <scene>/colmap/frames.json          per-frame metadata, including the normalized time in [0, 1]
         <scene>/colmap/split.json           {'train': [names], 'test': [names]}
         <scene>/colmap/masks/<stem>.png     glass masks M_t (or the frame's 'source_mask' path)
-        <scene>/<clean_images>/<stem>.*     reflection-removed targets I_t^clean
+        <scene>/<clean_images>/...          reflection-removed targets I_t^clean (see _find_clean_image), by default
+                                            <scene>/clean_image/<split>/images/<stem>.png, mirroring <scene>/<split>/images/
 
     `clean_images` may be absolute or relative to the scene folder. A missing clean image is an error unless
     `clean_fallback_original` is set, in which case the original image stands in for it. `ignore_clean_images`
     skips the clean folder altogether (the single-field ablation that fits the original images).
+
+    Clean images and masks are made from the source images (<scene>/<split>/images/), which for VSGD and Wayve are
+    the distorted originals, not the undistorted COLMAP images. Where the sizes differ they are only resized to the
+    COLMAP image, so they are off by a few pixels near the borders; a warning reports how many frames this affects.
     """
     colmap_dir = os.path.join(path, 'colmap')
     sparse_dir = os.path.join(colmap_dir, 'sparse', '0')
@@ -356,6 +382,7 @@ def readVigorSceneInfo(path, eval, clean_images='clean', clean_fallback_original
     cam_infos = []
     missing_clean = []
     mismatched_masks = 0
+    mismatched_clean = 0
     for extr in cam_extrinsics.values():
         name = os.path.basename(extr.name)
         # The COLMAP model may hold images that are not part of this scene (e.g. the other cameras of a rig).
@@ -387,9 +414,12 @@ def readVigorSceneInfo(path, eval, clean_images='clean', clean_fallback_original
             mismatched_masks += 1
 
         clean_image = None
-        clean_path = None if ignore_clean_images else _find_by_stem(clean_dir, stem)
+        split_name = frame.get('split') or ('train' if name in train_names else 'test')
+        clean_path = None if ignore_clean_images else _find_clean_image(clean_dir, frame, split_name, stem)
         if clean_path is not None:
             clean_image = Image.open(clean_path)
+            if clean_image.size != image.size:
+                mismatched_clean += 1
         elif not ignore_clean_images:
             missing_clean.append(name)
 
@@ -420,6 +450,8 @@ def readVigorSceneInfo(path, eval, clean_images='clean', clean_fallback_original
         print(f'[ WARN ] No clean image for {len(missing_clean)} of {len(cam_infos)} frames in {clean_dir}; using the original images as clean targets.')
     if mismatched_masks:
         print(f'[ WARN ] {mismatched_masks} glass masks differ in size from their images and will be resized; check that they are aligned.')
+    if mismatched_clean:
+        print(f'[ WARN ] {mismatched_clean} clean images differ in size from their images and will be resized; they come from the distorted source images, so they are not exactly aligned.')
 
     cam_infos = sorted(cam_infos, key=lambda c: c.image_name)
     if eval:

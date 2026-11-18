@@ -21,5 +21,5 @@ def test_parameters_missing_from_an_old_config_take_their_defaults(tmp_path, mon
     assert dataset.model_path == str(tmp_path)  # the command line wins over the config
     assert (dataset.resolution, dataset.eval, dataset.sh_degree, dataset.deform_width) == (4, True, 2, 64)  # from the config
     assert (dataset.eta_air, dataset.eta_glass, dataset.optical_correction) == (1.0, 1.5, False)  # defaults
-    assert dataset.deform_depth == 8 and dataset.clean_images == 'clean'
+    assert dataset.deform_depth == 8 and dataset.clean_images == 'clean_image'
     assert opt.extract(args).iterations == 123

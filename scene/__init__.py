@@ -43,7 +43,7 @@ class Scene:
 
         if os.path.exists(os.path.join(args.source_path, 'colmap', 'frames.json')):
             print('Found colmap/frames.json, assuming the VIGOR-GS scene layout.')
-            scene_info = sceneLoadTypeCallbacks['Vigor'](args.source_path, args.eval, getattr(args, 'clean_images', 'clean'), getattr(args, 'clean_fallback_original', False), getattr(args, 'ignore_clean_images', False))
+            scene_info = sceneLoadTypeCallbacks['Vigor'](args.source_path, args.eval, getattr(args, 'clean_images', 'clean_image'), getattr(args, 'clean_fallback_original', False), getattr(args, 'ignore_clean_images', False))
         elif os.path.exists(os.path.join(args.source_path, 'sparse')):
             scene_info = sceneLoadTypeCallbacks['Colmap'](args.source_path, args.images, args.eval)
         elif os.path.exists(os.path.join(args.source_path, 'transforms_train.json')):

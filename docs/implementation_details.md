@@ -100,7 +100,7 @@ Reader làm theo thứ tự sau:
    - **Bỏ qua ảnh không có trong `split.json`.** Model COLMAP của Wayve chứa ảnh của mọi camera trên rig (khoảng 1000 ảnh), trong khi scene chỉ dùng một phần.
    - Lấy FoV từ intrinsics. Chỉ nhận `PINHOLE` và `SIMPLE_PINHOLE`; model khác báo lỗi ngay thay vì cho ra hình học sai mà không ai hay.
    - Tìm mask ở `colmap/masks/<stem>.png`, nếu không có thì thử đường dẫn `source_mask` trong `frames.json`. Không có mask nào thì báo lỗi. Mask lệch kích thước với ảnh thì được đếm lại, cuối cùng in một cảnh báo.
-   - Tìm ảnh clean theo stem trong `<scene>/<clean_images>/` với các đuôi `.png/.jpg/.jpeg`. Thiếu thì ghi tên vào danh sách `missing_clean`.
+   - Tìm ảnh clean (`_find_clean_image`) dưới gốc `<scene>/<clean_images>/` (mặc định `clean_image`), với các đuôi `.png/.jpg/.jpeg`, theo thứ tự: thư mục lặp lại `source_image` của frame (ví dụ `clean_image/train/images/<stem>.png` cho `source_image = train/images/<stem>.jpg`), rồi `<split>/images/`, rồi chính thư mục gốc (layout phẳng). Quy tắc chỉ dựa vào `frames.json` và `split.json`, nên dùng chung cho mọi bộ dữ liệu. Thiếu thì ghi tên vào danh sách `missing_clean`. Ảnh clean lệch kích thước với ảnh COLMAP (VSGD: 1920×1080 so với ảnh đã undistort) được đếm và báo một cảnh báo; `loadCam` chỉ resize, không undistort.
 4. Sau vòng lặp: nếu còn ảnh thiếu bản clean mà không bật `--clean_fallback_original` thì báo lỗi, kèm số ảnh thiếu và tên một ảnh làm ví dụ. Bật cờ thì chỉ in cảnh báo.
 5. Chia train/test theo `split.json` (thay cho `llffhold` của reader COLMAP). Không có `--eval` thì mọi ảnh đều vào train.
 6. Point cloud khởi tạo lấy từ `points3D.bin`, chuyển sang `.ply` ở lần đọc đầu tiên.
@@ -135,7 +135,7 @@ Các trường này được lưu vào `cfg_args` và đi theo model qua mọi b
 
 | Nhóm | Trường | Mặc định | Ý nghĩa |
 |---|---|---|---|
-| Dữ liệu | `clean_images` | `clean` | Thư mục ảnh clean (tuyệt đối, hoặc tương đối so với scene) |
+| Dữ liệu | `clean_images` | `clean_image` | Thư mục gốc của ảnh clean (tuyệt đối, hoặc tương đối so với scene), bên trong là `<split>/images/<stem>.*` hoặc phẳng `<stem>.*` |
 | | `clean_fallback_original` | `False` | Thiếu ảnh clean thì dùng ảnh gốc |
 | | `linear_rgb` | `False` | Đổi ảnh sang linear khi load. `train_interface.py` tự đặt thành `True` trừ khi có `--srgb` |
 | Deformation | `deform_depth`, `deform_width` | 8, 256 | Kích thước MLP (giống Deformable-3DGS) |
@@ -644,7 +644,8 @@ Chạy bằng `python -m pytest` trong WSL (lệnh đầy đủ ở `CLAUDE.md`)
 | File | Kiểm chứng chính |
 |---|---|
 | `test_env.py` | CUDA và các extension import được; rasterizer 2DGS chạy |
-| `test_data.py` | Split theo `split.json`; `time` chuẩn hoá và tăng dần; mask khớp kích thước; thiếu ảnh clean thì báo lỗi, có cờ fallback thì dùng ảnh gốc; `linear_rgb` đổi cả hai ảnh đích; sRGB↔linear là nghịch đảo của nhau; `Scene` nhận ra layout VIGOR |
+| `test_data.py` | Split theo `split.json`; `time` chuẩn hoá và tăng dần; mask khớp kích thước; thiếu ảnh clean thì báo lỗi, có cờ fallback thì dùng ảnh gốc; ảnh clean theo layout `<split>/images/` khác kích thước vẫn được tìm và resize; `linear_rgb` đổi cả hai ảnh đích; sRGB↔linear là nghịch đảo của nhau; `Scene` nhận ra layout VIGOR |
+| `test_clean_lookup.py` | Thứ tự tìm ảnh clean: thư mục lặp lại `source_image` (đuôi bất kỳ), rồi `<split>/images/`, rồi thư mục phẳng; không lấy nhầm ảnh của split kia. Không cần GPU hay dữ liệu |
 | `test_deform.py` | Layout positional encoding; shape đầu ra với `scale_dim` 2 và 3; mọi `depth` đều dựng được mạng; mạng mới là phép đồng nhất; quaternion vẫn chuẩn hoá và scale vẫn dương sau deform; đầu ra phụ thuộc cả `t` lẫn `x`; gradient tới mọi lớp nhưng không tới tâm canonical; nhiễu thời gian; lr giảm dần; save/load; freeze |
 | `test_interface.py` | Đủ key và shape; gradient tới mọi tham số và tới MLP; `p` và `o` đóng vai trò riêng; offset 0 trùng render canonical; offset tịnh tiến bằng dời Gaussian; PLY round-trip; densify/prune giữ tham số và optimizer đồng bộ; prune theo `p` và tha đĩa chưa được nhìn thấy; reset kẹp đúng giá trị; capture/restore; freeze |
 | `test_train_interface.py` | Nhiễu thời gian giảm về 0; các thành phần loss bật đúng lịch; `L_rgb` so với ảnh clean; mask loss đẩy `o` đúng chiều; một lần train ngắn làm PSNR tăng và lưu đủ file |
