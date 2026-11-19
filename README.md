@@ -25,6 +25,8 @@ Training runs both sequential phases. If inferred glass geometry fails the cover
 
 Outputs include `interface/latest.pth`, `reflection/latest.pth`, `glass_geometry.json`, `data_alignment.json`, `config.json`, training JSONL logs, rendered test components, `results.json`, and `per_view.json`. Final images and quantitative metrics are in sRGB; fitting and composition use linear RGB.
 
+Every rendered split also gets `comparison.mp4` inside its method folder, for example `output/vsgd0758_quick/test/ours_6000/comparison.mp4`. It shows **Ours on the left** and **GT on the right**, with labels above the images. GT is the original observed photograph used for composite evaluation. Playback defaults to 30 FPS; set `--video_fps 15` to slow it down. Frames are ordered by sequence, camera and timestamp. Video encoding runs after rendering and is excluded from the measured rendering FPS.
+
 `results.json` also reports rendering `FPS` and total `Training Time` as `xx hours and xx mins`, with precise total/per-phase seconds. FPS excludes image saving; training time covers the optimization loops across both phases and resumed sessions. Unavailable timing is `null`. To update an existing result without recomputing PSNR/SSIM/LPIPS:
 
 ```bash

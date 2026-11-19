@@ -76,6 +76,58 @@ class CompositionTests(unittest.TestCase):
         self.assertIsNone(direct.grad)
 
 
+class ComparisonVideoTests(unittest.TestCase):
+    def test_encoded_video_has_ours_left_gt_right_and_preserves_frame_order(self):
+        import tempfile
+        from pathlib import Path
+        import cv2
+        import numpy as np
+        from PIL import Image
+        from render import create_comparison_video
+
+        with tempfile.TemporaryDirectory(prefix='vigor-comparison-') as directory:
+            root=Path(directory)
+            for sub in ('renders','gt'): (root/sub).mkdir()
+            # Odd dimensions exercise codec padding; the second frame is smaller.
+            for name,size,ours,gt in [('later',(25,33),(0,255,0),(255,255,0)),
+                                      ('earlier',(21,29),(255,0,0),(0,0,255))]:
+                for sub,color in [('renders',ours),('gt',gt)]:
+                    Image.fromarray(np.full((*size,3),color,dtype=np.uint8)).save(root/sub/(name+'.png'))
+            path=create_comparison_video(root,['earlier','later'],fps=12.)
+            capture=cv2.VideoCapture(str(path))
+            try:
+                self.assertTrue(capture.isOpened())
+                self.assertAlmostEqual(capture.get(cv2.CAP_PROP_FPS),12.,places=2)
+                for left,right in [((0,0,255),(255,0,0)),((0,255,0),(0,255,255))]:
+                    ok,frame=capture.read()
+                    self.assertTrue(ok)
+                    self.assertEqual(frame.shape,(66,66,3))
+                    # OpenCV decoding is BGR; allow lossy MPEG-4 quantization.
+                    np.testing.assert_allclose(frame[52,16],left,atol=15)
+                    np.testing.assert_allclose(frame[52,49],right,atol=15)
+                self.assertFalse(capture.read()[0])
+            finally:
+                capture.release()
+
+    def test_invalid_video_inputs_are_rejected(self):
+        import tempfile
+        from pathlib import Path
+        from PIL import Image
+        from render import create_comparison_video
+
+        with tempfile.TemporaryDirectory(prefix='vigor-comparison-') as directory:
+            root=Path(directory)
+            for fps in (0.,-1.,float('nan'),float('inf')):
+                with self.subTest(fps=fps), self.assertRaises(ValueError):
+                    create_comparison_video(root,['frame'],fps)
+            with self.assertRaises(ValueError): create_comparison_video(root,[])
+            for sub in ('renders','gt'): (root/sub).mkdir()
+            Image.new('RGB',(32,24)).save(root/'renders/frame.png')
+            Image.new('RGB',(32,26)).save(root/'gt/frame.png')
+            with self.assertRaisesRegex(ValueError,'size mismatch'):
+                create_comparison_video(root,['frame'])
+
+
 def torch_reference(origins, directions, patches, means, axes, opacity, colors, entries, width, height):
     """Scalar front-to-back integration, deliberately independent of CUDA code."""
     pixels = []
