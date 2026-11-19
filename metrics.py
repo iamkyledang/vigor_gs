@@ -1,138 +1,76 @@
-#
-# Copyright (C) 2023, Inria
-# GRAPHDECO research group, https://team.inria.fr/graphdeco
-# All rights reserved.
-#
-# This software is free for non-commercial, research and evaluation use
-# under the terms of the LICENSE.md file.
-#
-# For inquiries contact  george.drettakis@inria.fr
-#
-
+"""Streaming sRGB benchmark metrics with explicit glass-pixel normalization."""
 import json
-import os
 from argparse import ArgumentParser
 from pathlib import Path
-
-import torch
-import torchvision.transforms.functional as tf
+import numpy as np
 from PIL import Image
+import torch
 from tqdm import tqdm
-
-from lpipsPyTorch import LPIPS
-from utils.image_utils import psnr
 from utils.loss_utils import ssim
 
-lpips = LPIPS(net_type='vgg').cuda()
+
+def read_image(path,device,gray=False):
+    image=np.asarray(Image.open(path).convert('L' if gray else 'RGB')).copy()
+    value=torch.from_numpy(image).float().div_(255)
+    return (value[None,None] if gray else value.permute(2,0,1)[None]).to(device)
 
 
-def readImages(renders_dir, gt_dir, masks_dir):
-    renders = []
-    gts = []
-    masks = []
-    image_names = []
-    for fname in sorted(os.listdir(renders_dir)):
-        render = Image.open(renders_dir / fname)
-        gt = Image.open(gt_dir / fname)
-        mask = Image.open(masks_dir / fname)
-        renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda())
-        gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].cuda())
-        mask_tensor = tf.to_tensor(mask.convert('L')).unsqueeze(0).cuda()
-        masks.append((mask_tensor > 0.5).float())
-        image_names.append(fname)
-    return renders, gts, masks, image_names
+def masked_psnr(prediction,target,mask):
+    count=mask.sum()*prediction.shape[1]
+    if count==0: return None
+    mse=((prediction-target).square()*mask).sum()/count
+    return float(-10*torch.log10(mse.clamp_min(1e-12)))
 
 
-def evaluate(model_paths):
-    full_dict = {}
-    per_view_dict = {}
-    full_dict_polytopeonly = {}
-    per_view_dict_polytopeonly = {}
-
-    for scene_dir in model_paths:
-        print('Scene:', scene_dir)
-        full_dict[scene_dir] = {}
-        per_view_dict[scene_dir] = {}
-        full_dict_polytopeonly[scene_dir] = {}
-        per_view_dict_polytopeonly[scene_dir] = {}
-
-        test_dir = Path(scene_dir) / 'test'
-
-        for method in os.listdir(test_dir):
-            print('Method:', method)
-
-            full_dict[scene_dir][method] = {}
-            per_view_dict[scene_dir][method] = {}
-            full_dict_polytopeonly[scene_dir][method] = {}
-            per_view_dict_polytopeonly[scene_dir][method] = {}
-
-            method_dir = test_dir / method
-            gt_dir = method_dir / 'gt'
-            renders_dir = method_dir / 'renders'
-            masks_dir = method_dir / 'transparent_masks'
-            renders, gts, masks, image_names = readImages(renders_dir, gt_dir, masks_dir)
-
-            ssims = []
-            psnrs = []
-            lpipss = []
-
-            for idx in tqdm(range(len(renders)), desc='Metric evaluation progress'):
-                ssims.append(ssim(renders[idx], gts[idx]))
-                psnrs.append(psnr(renders[idx], gts[idx]))
-                lpipss.append(lpips(renders[idx], gts[idx]))
-
-            print('  SSIM : {:>12.7f}'.format(torch.tensor(ssims).mean(), ))
-            print('  PSNR : {:>12.7f}'.format(torch.tensor(psnrs).mean(), ))
-            print('  LPIPS: {:>12.7f}'.format(torch.tensor(lpipss).mean(), ))
-            print('')
-
-            masked_ssims = []
-            masked_psnrs = []
-            masked_lpips = []
-
-            for idx in tqdm(range(len(renders)), desc='Metric evaluation progress'):
-                if (masks[idx] > 0.5).any():
-                    masked_ssims.append(ssim(renders[idx] * masks[idx], gts[idx] * masks[idx]))
-                    masked_psnrs.append(psnr(renders[idx] * masks[idx], gts[idx] * masks[idx]))
-                    masked_lpips.append(lpips(renders[idx] * masks[idx], gts[idx] * masks[idx]))
-
-            print('  Masked SSIM : {:>12.7f}'.format(torch.tensor(masked_ssims).mean(), ))
-            print('  Masked PSNR : {:>12.7f}'.format(torch.tensor(masked_psnrs).mean(), ))
-            print('  Masked LPIPS: {:>12.7f}'.format(torch.tensor(masked_lpips).mean(), ))
-            print('')
-
-            full_dict[scene_dir][method].update({'SSIM': torch.tensor(ssims).mean().item(), 'PSNR': torch.tensor(psnrs).mean().item(), 'LPIPS': torch.tensor(lpipss).mean().item()})
-            per_view_dict[scene_dir][method].update(
-                {
-                    'SSIM': {name: ssim for ssim, name in zip(torch.tensor(ssims).tolist(), image_names)},
-                    'PSNR': {name: psnr for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)},
-                    'LPIPS': {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)},
-                }
-            )
-
-            full_dict[scene_dir][method].update(
-                {'Masked SSIM': torch.tensor(masked_ssims).mean().item(), 'Masked PSNR': torch.tensor(masked_psnrs).mean().item(), 'Masked LPIPS': torch.tensor(masked_lpips).mean().item()}
-            )
-            per_view_dict[scene_dir][method].update(
-                {
-                    'Masked SSIM': {name: ssim for ssim, name in zip(torch.tensor(masked_ssims).tolist(), image_names)},
-                    'Masked PSNR': {name: psnr for psnr, name in zip(torch.tensor(masked_psnrs).tolist(), image_names)},
-                    'Masked LPIPS': {name: lp for lp, name in zip(torch.tensor(masked_lpips).tolist(), image_names)},
-                }
-            )
-
-        with open(scene_dir + '/results.json', 'w') as fp:
-            json.dump(full_dict[scene_dir], fp, indent=True)
-        with open(scene_dir + '/per_view.json', 'w') as fp:
-            json.dump(per_view_dict[scene_dir], fp, indent=True)
+@torch.no_grad()
+def evaluate(model_paths,device='cuda',skip_lpips=False,split='test'):
+    perceptual=None
+    if not skip_lpips:
+        from lpipsPyTorch import LPIPS
+        perceptual=LPIPS(net_type='vgg').to(device).eval()
+    for model_path in model_paths:
+        root=Path(model_path);parent=root/split
+        if not parent.exists(): raise FileNotFoundError(f'No {split} renders at {parent}; run render.py first.')
+        results={};per_view={}
+        for method in sorted(parent.iterdir()):
+            if not (method/'renders').is_dir(): continue
+            values={}
+            files=sorted((method/'renders').glob('*.png'))
+            if not files: raise ValueError(f'No rendered images in {method}')
+            for path in tqdm(files,desc=method.name):
+                pred=read_image(path,device);target=read_image(method/'gt'/path.name,device)
+                mask=read_image(method/'transparent_masks'/path.name,device,True)>0.5
+                valid_path=method/'valid_masks'/path.name
+                valid=read_image(valid_path,device,True)>0.5 if valid_path.exists() else torch.ones_like(mask)
+                if pred.shape!=target.shape: raise ValueError(f'Size mismatch for {path.name}')
+                record={'PSNR':masked_psnr(pred,target,torch.ones_like(mask)),
+                    'SSIM':float(ssim(pred,target)),
+                    'Valid PSNR':masked_psnr(pred,target,valid),
+                    'Glass PSNR':masked_psnr(pred,target,mask&valid),
+                    'Opaque PSNR':masked_psnr(pred,target,(~mask)&valid),
+                    # These padded metrics reproduce the RT-Splatting comparison protocol.
+                    'Masked PSNR (RT padded)':masked_psnr(pred*mask,target*mask,torch.ones_like(mask)),
+                    'Masked SSIM (RT padded)':float(ssim(pred*mask,target*mask)) if mask.any() else None}
+                if perceptual is not None:
+                    record['LPIPS']=float(perceptual(pred*2-1,target*2-1))
+                    record['LPIPS (RT input)']=float(perceptual(pred,target))
+                    record['Masked LPIPS (RT padded)']=float(perceptual(pred*mask,target*mask)) if mask.any() else None
+                values[path.name]=record
+            keys=next(iter(values.values())).keys()
+            summary={key:float(np.mean([v[key] for v in values.values() if v[key] is not None]))
+                     if any(v[key] is not None for v in values.values()) else None for key in keys}
+            results[method.name]=summary;per_view[method.name]=values
+            print(method.name,json.dumps(summary,indent=2))
+        if not results: raise ValueError(f'No render methods found under {parent}')
+        (root/'results.json').write_text(json.dumps(results,indent=2,allow_nan=False))
+        (root/'per_view.json').write_text(json.dumps(per_view,indent=2,allow_nan=False))
 
 
-if __name__ == '__main__':
-    device = torch.device('cuda:0')
-    torch.cuda.set_device(device)
-
-    # Set up command line argument parser
-    parser = ArgumentParser(description='Training script parameters')
-    parser.add_argument('--model_paths', '-m', required=True, nargs='+', type=str, default=[])
-    args = parser.parse_args()
-    evaluate(args.model_paths)
+if __name__=='__main__':
+    parser=ArgumentParser(description=__doc__)
+    parser.add_argument('-m','--model_paths',nargs='+',required=True)
+    parser.add_argument('--device',default='cuda')
+    parser.add_argument('--skip_lpips',action='store_true',help='Explicitly omit LPIPS; useful for dependency smoke checks.')
+    parser.add_argument('--split',choices=['train','test'],default='test')
+    args=parser.parse_args()
+    evaluate(args.model_paths,args.device,args.skip_lpips,args.split)

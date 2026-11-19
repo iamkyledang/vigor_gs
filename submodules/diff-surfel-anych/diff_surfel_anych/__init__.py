@@ -165,7 +165,6 @@ class _RasterizeGaussians(torch.autograd.Function):
             grad_cov3Ds_precomp,
             None,
             None,
-            None,
         )
 
         return grads
@@ -236,3 +235,24 @@ class GaussianRasterizer(nn.Module):
             raster_settings,
             num_channels,
         )
+
+
+class _VigorRays(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, origins, directions, patches, means, inverse_axes, opacity, colors, entries, ranges, width, height, tile, cutoff):
+        if not hasattr(_C, 'vigor_ray_forward'):
+            raise RuntimeError('Rebuild VIGOR_GS/submodules/diff-surfel-anych: the installed extension lacks the VIGOR ray renderer.')
+        image, trans, last = _C.vigor_ray_forward(origins, directions, patches, means, inverse_axes, opacity, colors, entries, ranges, width, height, tile, cutoff)
+        ctx.save_for_backward(origins, directions, patches, means, inverse_axes, opacity, colors, entries, ranges, trans, last)
+        ctx.settings = width, height, tile, cutoff
+        return image
+
+    @staticmethod
+    def backward(ctx, gradient):
+        gm, ga, go, gc = _C.vigor_ray_backward(*ctx.saved_tensors, gradient.contiguous(), *ctx.settings)
+        return None, None, None, gm, ga, go, gc, None, None, None, None, None, None
+
+
+def render_reflected_rays(origins, directions, patches, means, inverse_axes, opacity, colors, entries, ranges, width, height, tile=16, cutoff=3.5):
+    tensors = [origins, directions, patches, means, inverse_axes, opacity, colors, entries, ranges]
+    return _VigorRays.apply(*(x.contiguous() for x in tensors), width, height, tile, cutoff)

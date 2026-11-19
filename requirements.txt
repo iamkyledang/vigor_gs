@@ -1,18 +1,10 @@
+# Python 3.10; use the CUDA 11.8 PyTorch build for the RTX 3060.
 torch==2.0.1
 torchvision==0.15.2
-imageio
-imageio-ffmpeg
-kornia
-matplotlib
-ninja
 numpy<2
-open3d
-opencv-python
+opencv-python<4.12
 plyfile
-scikit-image
-scikit-learn
 scipy
-torchmetrics
-mediapy
 tqdm
-setuptools==81.0.0
+# CUDA extensions are built from the existing submodules:
+# submodules/simple-knn and submodules/diff-surfel-anych

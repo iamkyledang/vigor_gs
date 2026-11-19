@@ -1,380 +1,303 @@
-#
-# Copyright (C) 2023, Inria
-# GRAPHDECO research group, https://team.inria.fr/graphdeco
-# All rights reserved.
-#
-# This software is free for non-commercial, research and evaluation use
-# under the terms of the LICENSE.md file.
-#
-# For inquiries contact  george.drettakis@inria.fr
-#
-
+"""Sequential VIGOR-GS training in the existing RT-Splatting entry point."""
+import json
 import os
-import sys
-from argparse import ArgumentParser, Namespace
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
+from pathlib import Path
+import random
+import time
+from argparse import ArgumentParser
+from collections import OrderedDict
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
-from arguments import ModelParams, OptimizationParams, PipelineParams
-from gaussian_renderer import *
-from scene import GaussianModel, Scene
-from utils.general_utils import safe_state
-from utils.image_utils import apply_colormap, local_variance, log_normalize, psnr
-from utils.loss_utils import binary_cross_entropy, l1_loss, lpips, ssim
-
-try:
-    from torch.utils.tensorboard import SummaryWriter
-
-    TENSORBOARD_FOUND = True
-except ImportError:
-    TENSORBOARD_FOUND = False
+from arguments import ModelParams, PipelineParams, OptimizationParams
+from scene import Scene
+from scene.gaussian_model import GaussianModel, Deformation, OpticalCorrection
+from gaussian_renderer import render_interface, render_composite, ray_geometry
+from utils.point_utils import extract_patches, validate_patches
+from utils.color_utils import srgb2linear
+from utils.loss_utils import ssim
+from utils.system_utils import record_implementation_change
 
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint):
-    first_iter = 0
-    tb_writer, tb_executor = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.sh_degree, dataset)
-
-    scene = Scene(dataset, gaussians, resolution_scales=[1.0])
-
-    gaussians.training_setup(opt)
-
-    if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
-        gaussians.restore(model_params, opt)
-
-    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
-    background = torch.tensor(bg_color, dtype=torch.float32, device='cuda')
-
-    iter_start = torch.cuda.Event(enable_timing=True)
-    iter_end = torch.cuda.Event(enable_timing=True)
-
-    ###########################################################################
-    viewpoint_stack = scene.getTrainCameras(scale=1.0).copy()
-    print('Training set length', len(viewpoint_stack))
-
-    ema_loss_dict = {}
-    progress_bar = tqdm(range(first_iter, opt.iterations), desc='Training progress')
-    first_iter += 1
-    last_reset_iter = -100000
-    pipe.init_stage = True
-
-    for iteration in range(first_iter, opt.iterations + 1):
-        iter_start.record()
-
-        gaussians.update_learning_rate(iteration)
-
-        if iteration % 1000 == 0:
-            gaussians.oneupSHdegree()
-
-        data_idx = np.random.randint(len(viewpoint_stack))
-
-        viewpoint_cam = viewpoint_stack[data_idx]
-        gt_image = viewpoint_cam.original_image.cuda()
-        gt_transparent_mask = viewpoint_cam.gt_transparent_mask.cuda()
-
-        if gt_image.shape[0] == 4:
-            bg = torch.rand((3), device='cuda')
-            gt_image = gt_image[:3, ...] * gt_image[3:, ...] + (1 - gt_image[3:, ...]) * bg[:, None, None]
-        else:
-            bg = torch.zeros((3), device='cuda')
-
-        if iteration >= opt.init_until_iter:
-            pipe.init_stage = False
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
-
-        viewspace_point_tensor = render_pkg['viewspace_points']
-        visibility_filter = render_pkg['visibility_filter']
-        radii = render_pkg['radii']
-
-        final_rendering = render_pkg['final_rendering']
-        final_tran = render_pkg['final_tran']
-        final_scat = render_pkg['final_scat']
-        final_spec = render_pkg['final_spec']
-        render_tran = render_pkg['render_tran']
-        render_scat = render_pkg['render_scat']
-        transmissivity = render_pkg['transmissivity']
-        foreground = render_pkg['foreground']
-
-        surface_normal = render_pkg['surface_normal']
-        surface_depth_normal = render_pkg['surface_depth_normal']
-        surface_opacity = render_pkg['surface_opacity']
-
-        volume_dist = render_pkg['volume_dist']
-
-        loss = 0.0
-        loss_dict = {}
-
-        if iteration < opt.norm_loss_from_iter:
-            loss_diff = (1.0 - opt.lambda_dssim) * l1_loss(render_tran, gt_image) + opt.lambda_dssim * (1.0 - ssim(render_tran, gt_image))
-            loss += loss_diff
-            loss_dict['diff'] = loss_diff.item()
-        elif iteration < opt.init_until_iter:
-            loss_diff = (1.0 - opt.lambda_dssim) * l1_loss(final_rendering, gt_image) + opt.lambda_dssim * (1.0 - ssim(final_rendering, gt_image))
-            loss += loss_diff
-            loss_dict['diff'] = loss_diff.item()
-        else:
-            if iteration < opt.mask_loss_from_iter:
-                detached_rendering = final_rendering
-            else:
-                spec_variance = local_variance(final_spec, weights=1 - surface_opacity.detach())
-                spec_complexity = 1 - torch.exp(-opt.local_var_scale * spec_variance.detach())
-                detached_tran = final_tran.detach() * spec_complexity + final_tran * (1 - spec_complexity)
-
-                detached_rendering = final_scat + detached_tran + final_spec
-
-            loss_pbr = (1.0 - opt.lambda_dssim) * l1_loss(detached_rendering, gt_image) + opt.lambda_dssim * (1.0 - ssim(detached_rendering, gt_image))
-            loss += loss_pbr
-            loss_dict['pbr'] = loss_pbr.item()
-
-            if opt.lambda_lpips > 0 and iteration >= opt.lpips_loss_from_iter:
-                loss_lpips = opt.lambda_lpips * lpips(detached_rendering, gt_image)
-                loss += loss_lpips
-                loss_dict['lpips'] = loss_lpips.item()
-
-        if opt.occupancy_decay_weight > 0 and iteration >= opt.init_until_iter:
-            occupancy_loss = opt.occupancy_decay_weight * (gaussians.get_occupancy[visibility_filter]).mean()
-            loss += occupancy_loss
-            loss_dict['occupancy'] = occupancy_loss.item()
-
-        if iteration >= opt.norm_loss_from_iter and opt.norm_loss_weight > 0:
-            error = 1 - (surface_normal * surface_depth_normal).sum(dim=0, keepdim=True)
-            error = error * foreground
-            norm_loss = opt.norm_loss_weight * error.mean()
-            loss += norm_loss
-            loss_dict['norm'] = norm_loss.item()
-
-        if iteration >= opt.dist_loss_from_iter and opt.dist_loss_weight > 0:
-            dist_loss = opt.dist_loss_weight * volume_dist.mean()
-            loss += dist_loss
-            loss_dict['dist'] = dist_loss.item()
-
-        if opt.mask_loss_from_iter == -1:
-            opt.mask_loss_from_iter = opt.init_until_iter
-        if opt.mask_loss_weight > 0 and iteration >= opt.mask_loss_from_iter:
-            mask_loss = opt.mask_loss_weight * binary_cross_entropy(1 - surface_opacity, gt_transparent_mask.squeeze(0) * 1.0)
-            loss += mask_loss
-            loss_dict['mask'] = mask_loss.item()
-
-        if iteration >= opt.init_until_iter:
-            transmissivity_loss = opt.transmissivity_loss_weight * binary_cross_entropy(transmissivity[~gt_transparent_mask], 0)
-            loss += transmissivity_loss
-            loss_dict['transmissivity'] = transmissivity_loss.item()
-
-        if opt.consistency_loss_weight > 0 and iteration >= opt.init_until_iter:
-            consistency_loss = 0
-            tran_vals = transmissivity[gt_transparent_mask]
-            tran_mean = tran_vals.mean()
-            consistency_loss += opt.consistency_loss_weight * ((tran_vals - tran_mean) ** 2).sum()
-
-            scatter_vals = render_scat[:, gt_transparent_mask.squeeze(0)]
-            scatter_mean = scatter_vals.mean(dim=-1, keepdim=True)
-            consistency_loss += opt.consistency_loss_weight * ((scatter_vals - scatter_mean) ** 2).sum(dim=-1).mean()
-
-            loss += consistency_loss
-            loss_dict['consistency'] = consistency_loss.item()
-
-        total_loss = loss
-        total_loss.backward()
-        iter_end.record()
-
-        with torch.no_grad():
-            # Progress bar
-            for key, value in loss_dict.items():
-                ema_loss_dict[key] = 0.4 * value + 0.6 * ema_loss_dict.get(key, 0.0)
-
-            if iteration % 10 == 0:
-                monitor_dict = {**ema_loss_dict, 'Points': f'{len(gaussians.get_xyz)}'}
-                progress_bar.set_postfix(monitor_dict)
-
-                progress_bar.update(10)
-            if iteration == opt.iterations:
-                progress_bar.close()
-
-            iter_end.synchronize()
-            training_report(tb_writer, tb_executor, opt, iteration, loss, loss_dict, iter_start.elapsed_time(iter_end), testing_iterations, scene, partial(render, pipe=pipe, bg_color=bg))
-            if iteration in saving_iterations:
-                print('\n[ITER {}] Saving Gaussians'.format(iteration))
-                scene.save(iteration)
-
-            # Densification
-            if iteration < opt.densify_until_iter:
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, iteration)
-
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.occupancy_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, opt.occupancy_cull, scene.cameras_extent, size_threshold, last_reset_iter)
-
-                if iteration % opt.occupancy_reset_interval == 0:
-                    gaussians.reset_occupancy()
-                    last_reset_iter = iteration
-
-                if iteration >= opt.occupancy_reset_interval and iteration % opt.occupancy_reset_interval == opt.occupancy_reset_interval // 2:
-                    gaussians.reset_opacity()
-
-            # Optimizer step
-            if iteration < opt.iterations:
-                gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none=True)
-
-            if iteration in checkpoint_iterations:
-                print('\n[ITER {}] Saving Checkpoint'.format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + '/chkpnt' + str(iteration) + '.pth')
-    if tb_executor is not None:
-        tb_executor.shutdown()
 
 
-def prepare_output_and_logger(args):
-    scene_name = os.path.basename(args.source_path)
-    if not args.model_path:
-        args.model_path = os.path.join('./output', scene_name)
+def seed_everything(seed):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
-    # Set up output folder
-    print('Output folder: {}'.format(args.model_path))
-    os.makedirs(args.model_path, exist_ok=True)
-    with open(os.path.join(args.model_path, 'cfg_args'), 'w') as cfg_log_f:
-        cfg_log_f.write(str(Namespace(**vars(args))))
 
-    # Create Tensorboard writer
-    tb_writer = None
-    tb_executor = None
-    if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
-        tb_executor = ThreadPoolExecutor(max_workers=2)
+def pixel_l1(prediction,target,valid):
+    errors=(prediction-target).abs().sum(0)
+    mask=valid[0].bool()
+    if not mask.any(): raise ValueError('No valid image pixels.')
+    return errors[mask].mean()
+
+
+def checkpoint(path,pc,deformation,iteration,phase,optical=None,optical_optimizer=None):
+    path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
+    state={'version':1,'phase':phase,'iteration':iteration,'field':pc.capture(),
+        'deformation':deformation.state_dict(),'deform_optimizer':deformation.optimizer.state_dict(),
+        'rng_python':random.getstate(),'rng_numpy':np.random.get_state(),
+        'rng_torch':torch.get_rng_state(),'rng_cuda':torch.cuda.get_rng_state()}
+    if optical is not None:
+        state['optical']=optical.state_dict()
+        state['optical_optimizer']=optical_optimizer.state_dict() if optical_optimizer else None
+    temporary=path.with_suffix('.tmp');torch.save(state,temporary);os.replace(temporary,path)
+
+
+def load_field(path,args,field,extent,center,training=False):
+    state=torch.load(path,map_location='cpu',weights_only=False)
+    field_state=state['field']
+    field_state['params']={key:torch.nn.Parameter(value.detach().cuda(),requires_grad=training) for key,value in field_state['params'].items()}
+    for key in ('max_radii2D','xyz_gradient_accum','denom','last_update'):
+        field_state[key]=field_state[key].cuda()
+    if not training: field_state['optimizer']=None
+    pc=GaussianModel(args.sh_degree,args,field=field)
+    pc.restore(state['field'],args)
+    if training and pc.num_points>pc.max_points:
+        raise ValueError('The resumed field already exceeds the requested point cap; keep a cap at least as large as its checkpoint.')
+    deformation=Deformation(pc.SCALE_DIM,args,center,extent).cuda()
+    deformation.load_state_dict(state['deformation'])
+    deformation.optimizer=torch.optim.Adam(deformation.parameters(),lr=args.deform_lr) if training else None
+    if training: deformation.optimizer.load_state_dict(state['deform_optimizer'])
     else:
-        print('Tensorboard not available: not logging progress')
-    return tb_writer, tb_executor
+        pc.freeze();deformation.requires_grad_(False);deformation.eval()
+    return pc,deformation,state
 
 
-@torch.no_grad()
-def training_report(tb_writer, tb_executor, opt, iteration, loss, loss_dict, elapsed, testing_iterations, scene: Scene, renderFunc):
-    if tb_writer:
-        tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
-        for key, value in loss_dict.items():
-            tb_writer.add_scalar(f'train_loss_patches/{key}', value, iteration)
-        tb_writer.add_scalar('iter_time', elapsed, iteration)
-        tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
-
-    # Report test and samples of training set
-    if iteration in testing_iterations:
-        torch.cuda.empty_cache()
-        validation_configs = (
-            {'name': 'test', 'cameras': scene.getTestCameras()},
-            {'name': 'train', 'cameras': [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]},
-        )
-        for config in validation_configs:
-            if config['cameras'] and len(config['cameras']) > 0:
-                l1_test = 0.0
-                psnr_test = 0.0
-                ssim_test = 0.0
-                lpips_test = 0.0
-                window_psnr_test = 0.0
-                opaque_psnr_test = 0.0
-                for idx, viewpoint in enumerate(config['cameras']):
-                    render_pkg = renderFunc(viewpoint, scene.gaussians)
-                    image = torch.clamp(render_pkg['final_rendering'], 0.0, 1.0)
-                    gt_image = torch.clamp(viewpoint.original_image.to('cuda'), 0.0, 1.0)
-                    gt_transparent_mask = viewpoint.gt_transparent_mask.cuda()
-                    if tb_writer and (idx < 5):
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/render', image, global_step=iteration)
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/final_specular', render_pkg['final_spec'].clip(0, 1), global_step=iteration)
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/final_scatter', render_pkg['final_scat'].clip(0, 1), global_step=iteration)
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/final_transmitted', render_pkg['final_tran'].clip(0, 1), global_step=iteration)
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/render_scatter', render_pkg['render_scat'].clip(0, 1), global_step=iteration)
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/render_specular', render_pkg['render_spec'].clip(0, 1), global_step=iteration)
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/render_transmitted', render_pkg['render_tran'].clip(0, 1), global_step=iteration)
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/reflectance', render_pkg['reflectance'], global_step=iteration)
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/transmissivity', render_pkg['transmissivity'], global_step=iteration)
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/roughness', render_pkg['roughness'], global_step=iteration)
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/attenuation', render_pkg['attenuation'], global_step=iteration)
-
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/surface_alpha', render_pkg['surface_alpha'], global_step=iteration)
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/surface_depth', apply_colormap(log_normalize(render_pkg['surface_depth'])), global_step=iteration)
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/surface_normal', render_pkg['surface_normal'] * 0.5 + 0.5, global_step=iteration)
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/surface_depth_normal', render_pkg['surface_depth_normal'] * 0.5 + 0.5, global_step=iteration)
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/surface_opacity', render_pkg['surface_opacity'], global_step=iteration)
-
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/volume_alpha', render_pkg['volume_alpha'], global_step=iteration)
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/volume_depth', apply_colormap(log_normalize(render_pkg['volume_depth'])), global_step=iteration)
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/volume_normal', render_pkg['volume_normal'] * 0.5 + 0.5, global_step=iteration)
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/volume_depth_normal', render_pkg['volume_depth_normal'] * 0.5 + 0.5, global_step=iteration)
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/volume_opacity', render_pkg['volume_opacity'], global_step=iteration)
-
-                        spec_variance = local_variance(render_pkg['final_spec'], weights=1 - render_pkg['surface_opacity'].detach())
-                        spec_complexity = 1 - torch.exp(-opt.local_var_scale * spec_variance.detach())
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/spec_variance', opt.local_var_scale * spec_variance, global_step=iteration)
-                        tb_executor.submit(tb_writer.add_image, config['name'] + f'_view_{viewpoint.image_name}/spec_complexity', spec_complexity, global_step=iteration)
-
-                        if iteration == testing_iterations[0]:
-                            tb_executor.submit(tb_writer.add_image, config['name'] + '_view_{}/ground_truth'.format(viewpoint.image_name), gt_image, global_step=iteration)
-
-                    l1_value = l1_loss(image, gt_image).mean().double()
-                    psnr_value = psnr(image, gt_image).mean().double()
-                    ssim_value = ssim(image, gt_image).mean().double()
-                    lpips_value = lpips(image, gt_image).mean().double()
-                    window_psnr_value = psnr(image * gt_transparent_mask, gt_image * gt_transparent_mask).mean().double() if gt_transparent_mask.any() else 0.0
-                    opaque_psnr_value = psnr(image * ~gt_transparent_mask, gt_image * ~gt_transparent_mask).mean().double() if (~gt_transparent_mask).any() else 0.0
-                    if tb_writer:
-                        tb_writer.add_scalar(f'per_view_{config["name"]}/l1_loss - {viewpoint.image_name}', l1_value, iteration)
-                        tb_writer.add_scalar(f'per_view_{config["name"]}/psnr - {viewpoint.image_name}', psnr_value, iteration)
-                        tb_writer.add_scalar(f'per_view_{config["name"]}/ssim - {viewpoint.image_name}', ssim_value, iteration)
-                        tb_writer.add_scalar(f'per_view_{config["name"]}/lpips - {viewpoint.image_name}', lpips_value, iteration)
-                        tb_writer.add_scalar(f'per_view_{config["name"]}/window_psnr - {viewpoint.image_name}', window_psnr_value, iteration)
-                        tb_writer.add_scalar(f'per_view_{config["name"]}/opaque_psnr - {viewpoint.image_name}', opaque_psnr_value, iteration)
-                    l1_test += l1_value
-                    psnr_test += psnr_value
-                    ssim_test += ssim_value
-                    lpips_test += lpips_value
-                    window_psnr_test += window_psnr_value
-                    opaque_psnr_test += opaque_psnr_value
-
-                psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])
-                ssim_test /= len(config['cameras'])
-                lpips_test /= len(config['cameras'])
-                window_psnr_test /= len(config['cameras'])
-                opaque_psnr_test /= len(config['cameras'])
-                print(f'\n[ITER {iteration}] Evaluating {config["name"]}: PSNR {psnr_test}, SSIM {ssim_test}, LPIPS {lpips_test}, Window PSNR {window_psnr_test}, Opaque PSNR {opaque_psnr_test}')
-                if tb_writer:
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - ssim', ssim_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - lpips', lpips_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - window_psnr', window_psnr_test, iteration)
-                    tb_writer.add_scalar(config['name'] + '/loss_viewpoint - opaque_psnr', opaque_psnr_test, iteration)
-
-        torch.cuda.empty_cache()
+class DirectCache:
+    def __init__(self,interface,deformation,pipe,capacity=16):
+        self.interface,self.deformation,self.pipe=interface,deformation,pipe
+        self.capacity=capacity;self.entries=OrderedDict()
+    @torch.no_grad()
+    def __call__(self,cam):
+        if cam.uid not in self.entries:
+            direct=render_interface(cam,self.interface,self.deformation,self.pipe)['direct'].cpu()
+            self.entries[cam.uid]=direct
+            if len(self.entries)>self.capacity: self.entries.popitem(last=False)
+        self.entries.move_to_end(cam.uid)
+        return self.entries[cam.uid].cuda()
 
 
-if __name__ == '__main__':
-    # Set up command line argument parser
-    parser = ArgumentParser(description='Training script parameters')
-    lp = ModelParams(parser)
-    op = OptimizationParams(parser)
-    pp = PipelineParams(parser)
-    parser.add_argument('--ip', type=str, default='127.0.0.1')
-    parser.add_argument('--port', type=int, default=6009)
-    parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument('--test_iterations', nargs='+', type=int, default=range(1_000, 300_001, 1_000))
-    parser.add_argument('--save_iterations', nargs='+', type=int, default=[])
-    parser.add_argument('--quiet', action='store_true')
-    parser.add_argument('--checkpoint_iterations', nargs='+', type=int, default=[])
-    parser.add_argument('--start_checkpoint', type=str, default=None)
-    args = parser.parse_args(sys.argv[1:])
-    args.save_iterations.append(args.iterations)
+def previous_frames(cameras):
+    previous={};groups={}
+    for cam in cameras: groups.setdefault((cam.sequence,getattr(cam,'sensor_id',0),cam.image_height,cam.image_width),[]).append(cam)
+    for views in groups.values():
+        views.sort(key=lambda c:c.time)
+        for i,cam in enumerate(views):
+            previous[cam.uid]=views[i-1] if i>0 and views[i-1].time<cam.time else None
+    return previous
 
-    print('Optimizing ' + args.model_path)
 
-    # Initialize system state (RNG)
-    safe_state(args.quiet)
+def initialize_reflection(scene,interface,deformation,patches,args,pipe,cache):
+    positions=[];colors=[]
+    views=scene.getTrainCameras()[::max(1,len(scene.getTrainCameras())//12)]
+    per_view=max(1,int(np.ceil(args.reflection_init_points/len(views))))
+    with torch.no_grad():
+        for cam in views:
+            geo=ray_geometry(cam,patches,args,pipe)
+            candidates=(geo['visible']&cam.valid_mask.cuda()[0]).flatten().nonzero().flatten()
+            if not len(candidates): continue
+            take=candidates[torch.randint(len(candidates),(per_view,),device='cuda')]
+            origin=geo['origins'].reshape(-1,3)[take]
+            direction=geo['directions'].reshape(-1,3)[take]
+            distance=scene.cameras_extent*(0.1+3*torch.rand(len(take),1,device='cuda'))
+            positions.append(origin+distance*direction)
+            direct=cache(cam).permute(1,2,0).reshape(-1,3)[take]
+            target=srgb2linear(cam.original_image.cuda()).permute(1,2,0).reshape(-1,3)[take]
+            alpha=geo['fresnel'].flatten()[take,None].clamp_min(0.01)
+            colors.append(((target-(1-alpha)*direct)/alpha).clamp(0,20))
+    if not positions: raise RuntimeError('No training rays meet the frozen glass geometry.')
+    pc=GaussianModel(args.sh_degree,args,field='reflection')
+    pc.create_from_points(torch.cat(positions)[:args.reflection_init_points],torch.cat(colors)[:args.reflection_init_points],scene.cameras_extent)
+    return pc
 
-    torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint)
 
-    # All done
-    print('\nTraining complete.')
+def train_phase(scene,args,pipe,phase,pc,deformation,patches=None,interface=None,interface_deform=None,resume=None):
+    length=args.iterations if phase=='interface' else args.reflection_iterations
+    if length<1: raise ValueError('Each trained phase needs at least one iteration.')
+    path=Path(args.model_path)/phase/'latest.pth'
+    start=0
+    if resume:
+        pc,deformation,state=load_field(resume,args,phase,scene.cameras_extent,scene.center,True)
+        if state['phase']!=phase: raise ValueError('Resume phase does not match checkpoint.')
+        start=state['iteration']
+    else:
+        pc.training_setup(args)
+        deformation.optimizer=torch.optim.Adam(deformation.parameters(),lr=args.deform_lr)
+    optical=OpticalCorrection(args.optical_bound).cuda() if phase=='reflection' else None
+    optical_optimizer=None
+    if optical is not None and not args.pure_fresnel:
+        optical_optimizer=torch.optim.Adam(optical.parameters(),lr=args.optical_lr)
+    if resume and optical is not None:
+        optical.load_state_dict(state['optical'])
+        if optical_optimizer and state.get('optical_optimizer'): optical_optimizer.load_state_dict(state['optical_optimizer'])
+    if resume:
+        # Restore after constructing all random-initialized modules.
+        random.setstate(state['rng_python']);np.random.set_state(state['rng_numpy'])
+        torch.set_rng_state(state['rng_torch'].cpu());torch.cuda.set_rng_state(state['rng_cuda'].cpu())
+    cameras=scene.getTrainCameras(); neighbors=previous_frames(cameras)
+    cache=DirectCache(interface,interface_deform,pipe,args.cache_views) if phase=='reflection' else None
+    history=Path(args.model_path)/phase/'training.jsonl';history.parent.mkdir(parents=True,exist_ok=True)
+    timer=time.perf_counter();ema=None
+    progress=tqdm(range(start+1,length+1),desc=phase)
+    for iteration in progress:
+        pc.optimizer.zero_grad(set_to_none=True);deformation.optimizer.zero_grad(set_to_none=True)
+        if optical_optimizer: optical_optimizer.zero_grad(set_to_none=True)
+        pc.update_learning_rate(iteration)
+        if iteration%1000==0: pc.oneupSHdegree()
+        fraction=min(iteration/max(length,1),1)
+        for group in deformation.optimizer.param_groups:
+            group['lr']=args.deform_lr*(0.01**fraction)
+        cam=random.choice(cameras);valid=cam.valid_mask.cuda()
+        deforming=iteration>min(args.warm_up,max(length-1,0))
+        terms={}
+        if phase=='interface':
+            out=render_interface(cam,pc,deformation,pipe,surface=args.lambda_glass>0 or not args.glass_geometry,deforming=deforming)
+            target=srgb2linear(cam.clean_image.cuda())
+            terms['rgb']=pixel_l1(out['direct'],target,valid)
+            if args.lambda_dssim: terms['ssim']=args.lambda_dssim*(1-ssim(out['direct'],target))
+            surface=out['surface_valid']&valid
+            if iteration>=args.surface_from_iter and surface.any():
+                terms['surface']=args.lambda_surface*(out['normal']-out['depth_normal']).abs().sum(0)[surface[0]].mean()
+            if args.lambda_glass>0:
+                glass=out['glass_map'].clamp(1e-5,1-1e-5)
+                terms['glass']=args.lambda_glass*F.binary_cross_entropy(glass[valid],cam.gt_transparent_mask.cuda().float()[valid])
+        else:
+            direct=cache(cam)
+            out=render_composite(cam,interface,interface_deform,pc,deformation,patches,optical,args,pipe,direct=direct,deforming=deforming)
+            target=srgb2linear(cam.original_image.cuda())
+            terms['rgb']=pixel_l1(out['composite'],target,valid)
+            if args.lambda_dssim: terms['ssim']=args.lambda_dssim*(1-ssim(out['composite'],target))
+            terms['optical']=args.lambda_optical*out['h'].square()[valid[0]].mean()
+            neighbor=neighbors[cam.uid]
+            if args.lambda_motion>0 and neighbor is not None:
+                previous=render_composite(neighbor,interface,interface_deform,pc,deformation,patches,optical,args,pipe,direct=cache(neighbor),deforming=deforming)
+                previous_target=srgb2linear(neighbor.original_image.cuda())
+                temporal_valid=valid&neighbor.valid_mask.cuda()
+                terms['motion']=args.lambda_motion*pixel_l1(out['composite']-previous['composite'],target-previous_target,temporal_valid)
+        loss=sum(terms.values())
+        if not torch.isfinite(loss): raise RuntimeError(f'Nonfinite {phase} loss at iteration {iteration}; last checkpoint remains intact.')
+        loss.backward()
+        # Collect gradients before optimizer step; mutate topology only after that step.
+        with torch.no_grad():
+            grow=iteration<min(args.densify_until_iter,length)
+            if grow:
+                if phase=='interface':
+                    visible=out['visibility_filter']
+                    pc.add_densification_stats(out['viewspace_points'],visible,iteration)
+                else:
+                    for entry in ([out,previous] if args.lambda_motion>0 and neighbor is not None else [out]):
+                        means=entry['deformed_means']
+                        if means.grad is not None:
+                            visible=entry['visibility_filter']
+                            pc.xyz_gradient_accum[visible]+=means.grad[visible].norm(dim=-1,keepdim=True)*scene.cameras_extent
+                            pc.denom[visible]+=1
+                            pc.last_update[visible]=iteration
+            pc.optimizer.step()
+            if deforming: deformation.optimizer.step()
+            if optical_optimizer: optical_optimizer.step()
+            if grow and iteration>args.densify_from_iter and iteration%args.densification_interval==0:
+                pc.densify_and_prune(args.densify_grad_threshold if phase=='interface' else args.reflection_grad_threshold,scene.cameras_extent)
+            value=float(loss);ema=value if ema is None else 0.95*ema+0.05*value
+            if iteration%10==0: progress.set_postfix(loss=f'{ema:.5f}',points=pc.num_points)
+            if iteration%args.report_interval==0 or iteration==length:
+                torch.cuda.synchronize()
+                record={'iteration':iteration,'loss':value,'points':pc.num_points,
+                    'elapsed_seconds':time.perf_counter()-timer,'peak_vram_mb':torch.cuda.max_memory_allocated()/2**20,
+                    **{name:float(term) for name,term in terms.items()}}
+                if phase=='reflection': record['tile_entries']=out['tile_entries']
+                with history.open('a') as stream: stream.write(json.dumps(record)+'\n')
+            if iteration%args.checkpoint_interval==0 or iteration==length:
+                checkpoint(path,pc,deformation,iteration,phase,optical,optical_optimizer)
+    if start>=length: print(f'{phase}: checkpoint already reached requested iteration {length}.')
+    return pc,deformation,optical
+
+
+def main():
+    parser=ArgumentParser(description=__doc__)
+    ModelParams(parser);PipelineParams(parser);OptimizationParams(parser)
+    parser.add_argument('--phase',choices=['all','interface','reflection'],default='all')
+    parser.add_argument('--resume',default='')
+    parser.add_argument('--cache_views',type=int,default=16)
+    parser.add_argument('--quiet',action='store_true')
+    args=parser.parse_args()
+    import sys
+    if args.model_path and (args.resume or args.phase=='reflection'):
+        config_path=Path(args.model_path)/'config.json'
+        if config_path.exists():
+            saved=json.loads(config_path.read_text())
+            explicit={token.split('=')[0].lstrip('-') for token in sys.argv[1:] if token.startswith('--')}
+            explicit |= {'source_path' if token=='-s' else 'model_path' if token=='-m' else 'resolution' for token in sys.argv[1:] if token in ('-s','-m','-r')}
+            for key,value in saved.items():
+                if key not in explicit and key not in ('phase','resume'):
+                    setattr(args,key,value)
+    if not args.source_path or not args.model_path: parser.error('-s and -m are required')
+    if args.checkpoint_interval<1 or args.report_interval<1 or args.cache_views<1: parser.error('Intervals/cache must be positive')
+    if args.eta_air<=0 or args.eta_glass<=0: parser.error('Refractive indices must be positive')
+    if args.sh_degree not in range(4): parser.error('SH degree must lie between zero and three')
+    if args.init_points<4 or args.reflection_init_points<4: parser.error('At least four initialization points per field are required')
+    if min(args.deform_depth,args.deform_width,args.max_patches,args.tile_size)<1: parser.error('Network, patch and tile dimensions must be positive')
+    if min(args.lambda_surface,args.lambda_motion,args.lambda_optical,args.lambda_glass,args.lambda_dssim)<0: parser.error('Loss weights must be nonnegative')
+    if args.plane_threshold<=0 or args.ray_cutoff<=0: parser.error('Geometry threshold and ray cutoff must be positive')
+    if min(args.densify_grad_threshold,args.reflection_grad_threshold)<=0: parser.error('Densification gradient thresholds must be positive')
+    if not torch.cuda.is_available(): raise RuntimeError('A CUDA GPU and the VIGOR CUDA extension are required.')
+    args.source_path=str(Path(args.source_path).resolve());args.model_path=str(Path(args.model_path).resolve())
+    output=Path(args.model_path);output.mkdir(parents=True,exist_ok=True)
+    if (output/'interface/latest.pth').exists() and args.phase!='reflection' and not args.resume:
+        raise FileExistsError('Model already has a checkpoint. Choose a fresh -m folder or --resume its checkpoint.')
+    if (output/'reflection/latest.pth').exists() and args.phase in ('all','reflection') and not args.resume:
+        raise FileExistsError('Reflection checkpoint exists. Use a fresh -m folder or --resume.')
+    config=output/'config.json'
+    if config.exists() and (args.resume or args.phase=='reflection'):
+        saved=json.loads(config.read_text())
+        for name in ('resolution','sh_degree','deform_depth','deform_width','deform_xyz_freqs','deform_time_freqs','eta_air','eta_glass','optical_bound','pure_fresnel'):
+            if saved[name]!=getattr(args,name):
+                raise ValueError(f'{name} differs from saved model configuration ({saved[name]}). Pass the same configuration when resuming.')
+    config.write_text(json.dumps(vars(args),indent=2))
+    record_implementation_change();seed_everything(args.seed)
+    scene=Scene(args)
+    if args.init_points>args.max_interface_points or args.reflection_init_points>args.max_reflection_points:
+        raise ValueError('Initial point counts exceed their configured point caps.')
+    resume_phase=torch.load(args.resume,map_location='cpu',weights_only=False)['phase'] if args.resume else None
+    trained_interface=args.phase in ('all','interface') and resume_phase!='reflection'
+    if trained_interface:
+        pc=GaussianModel(args.sh_degree,args)
+        pc.create_from_points(scene.point_cloud.points,srgb2linear(torch.as_tensor(scene.point_cloud.colors).float()).numpy(),scene.cameras_extent)
+        deformation=Deformation(2,args,scene.center,scene.cameras_extent).cuda()
+        interface,interface_deform,_=train_phase(scene,args,args,'interface',pc,deformation,resume=args.resume or None)
+    else:
+        interface,interface_deform,_=load_field(output/'interface/latest.pth',args,'interface',scene.cameras_extent,scene.center)
+    interface.freeze();interface_deform.requires_grad_(False);interface_deform.eval();interface_deform.optimizer=None
+    geometry_path=output/'glass_geometry.json'
+    if args.glass_geometry:
+        raw=json.loads(Path(args.glass_geometry).read_text())
+        records=raw['patches'] if isinstance(raw,dict) else raw
+        quality={'source':'provided'}
+        validate_patches(records)
+        geometry_path.write_text(json.dumps({'patches':records,'quality':quality},indent=2))
+    elif geometry_path.exists() and not trained_interface:
+        raw=json.loads(geometry_path.read_text());records,quality=raw['patches'],raw['quality']
+    else:
+        records,quality=extract_patches(scene.getTrainCameras(),interface,interface_deform,args,args,render_interface,scene.cameras_extent)
+        geometry_path.write_text(json.dumps({'patches':records,'quality':quality},indent=2))
+    if quality.get('coverage',1)<args.plane_min_coverage or quality.get('precision',1)<args.plane_min_precision:
+        raise RuntimeError('Extracted glass geometry failed coverage/precision checks. See glass_geometry.json; improve Phase I or supply geometry. No Phase II training was performed.')
+    if args.phase=='interface': return
+    patches=validate_patches(records)
+    # Release the frozen interface optimizer and stale gradient buffers before Phase II.
+    interface.optimizer=None
+    for name in interface.PARAMS: getattr(interface,'_'+name).grad=None
+    for parameter in interface_deform.parameters(): parameter.grad=None
+    torch.cuda.empty_cache()
+    for camera in scene.getTrainCameras(): camera.clean_image=None
+    cache=DirectCache(interface,interface_deform,args,args.cache_views)
+    reflection=initialize_reflection(scene,interface,interface_deform,patches,args,args,cache) if resume_phase!='reflection' else GaussianModel(args.sh_degree,args,'reflection')
+    reflection_deform=Deformation(3,args,scene.center,scene.cameras_extent).cuda()
+    train_phase(scene,args,args,'reflection',reflection,reflection_deform,patches,interface,interface_deform,args.resume if resume_phase=='reflection' else None)
+    print('Training complete:',args.model_path)
+
+
+if __name__=='__main__': main()

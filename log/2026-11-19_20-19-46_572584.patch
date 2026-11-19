@@ -1,0 +1,25 @@
+--- before/utils/system_utils.py
++++ after/utils/system_utils.py
+@@ -44,9 +44,9 @@
+     state_file=folder/'implementation_state.json'
+     previous=json.loads(state_file.read_text()) if state_file.exists() else {}
+     current={}
+-    for base in [root,root/'arguments',root/'scene',root/'gaussian_renderer',root/'utils',root/'submodules/diff-surfel-anych']:
++    for base in [root,root/'arguments',root/'scene',root/'gaussian_renderer',root/'utils',root/'submodules/diff-surfel-anych',root/'submodules/diff-surfel-anych/cuda_rasterizer',root/'submodules/simple-knn',root/'lpipsPyTorch',root/'lpipsPyTorch/modules']:
+         for path in base.iterdir():
+-            if path.is_file() and path.suffix in ('.py','.cu','.cpp','.h','.md'):
++            if path.is_file() and (path.suffix in ('.py','.cu','.cpp','.h','.md','.tex','.txt','.toml','.sh') or path.name=='.gitignore'):
+                 current[str(path.relative_to(root))]=path.read_text()
+     path=root/'submodules/diff-surfel-anych/diff_surfel_anych/__init__.py'
+     current[str(path.relative_to(root))]=path.read_text()
+@@ -63,7 +63,9 @@
+         patch.extend(difflib.unified_diff(previous.get(key,'').splitlines(True),current.get(key,'').splitlines(True),fromfile='before/'+key,tofile='after/'+key))
+     (folder/(stamp+'.patch')).write_text(''.join(patch))
+     (folder/(stamp+'.md')).write_text(note+'\n\nChanged files:\n'+''.join('- '+key+'\n' for key in changed))
+-    state_file.write_text(json.dumps(current))
++    temporary=folder/(stamp+'.state.tmp')
++    temporary.write_text(json.dumps(current))
++    os.replace(temporary,state_file)
+ 
+ 
+ def watch_implementation(interval=2.):

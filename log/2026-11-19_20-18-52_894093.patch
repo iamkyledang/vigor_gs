@@ -1,0 +1,111 @@
+--- before/scene/cameras.py
++++ after/scene/cameras.py
+@@ -19,9 +19,10 @@
+         self.FoVy = 2*np.arctan(self.image_height/(2*self.fy))
+         self.data_device = torch.device(data_device)
+         def tensor(image):
+-            return torch.from_numpy(np.ascontiguousarray(image)).permute(2,0,1).float().div_(255).to(self.data_device)
+-        self.original_image = tensor(info.image)
+-        self.clean_image = tensor(info.clean_image) if info.clean_image is not None else None
++            return torch.from_numpy(np.ascontiguousarray(image)).permute(2,0,1).to(self.data_device)
++        # Keep the dataset as bytes; decode only the sampled frame to float RGB.
++        self._original_image = tensor(info.image)
++        self._clean_image = tensor(info.clean_image) if info.clean_image is not None else None
+         self.gt_transparent_mask = torch.from_numpy(info.transparent_mask.copy())[None].to(self.data_device)
+         self.valid_mask = torch.from_numpy(info.valid_mask.copy())[None].to(self.data_device)
+         self.znear, self.zfar = 0.01, 1000.
+@@ -32,3 +33,15 @@
+         self.projection_matrix = projection.T.cuda()
+         self.full_proj_transform = self.world_view_transform @ self.projection_matrix
+         self.camera_center = self.world_view_transform.inverse()[3,:3]
++
++    @property
++    def original_image(self):
++        return self._original_image.float().div_(255)
++
++    @property
++    def clean_image(self):
++        return self._clean_image.float().div_(255) if self._clean_image is not None else None
++
++    @clean_image.setter
++    def clean_image(self, value):
++        self._clean_image=None if value is None else value.detach().clamp(0,1).mul(255).round().byte().to(self.data_device)
+--- before/specification.md
++++ after/specification.md
+@@ -19,7 +19,7 @@
+ - `colmap/sparse/0`: target camera calibration, poses and SfM initialization points.
+ - `colmap/frames.json`: explicit timestamps, sequence identity, and train/test split. No random holdout or time renormalization is introduced.
+ 
+-When original source intrinsics are missing, radial/fisheye recovery follows the useful calibration method in the reference implementation. Its parameters and held-out pixel residual are saved in the model output as `data_alignment.json`; a median residual over one pixel or fewer than 20 supporting validation matches is an error. Rectification happens in memory at the requested training resolution. Missing clean training targets are errors: original images never silently substitute for clean images. Intrinsics include the principal point and use COLMAP pixel centers at +0.5. Undistortion padding is excluded from training losses. Images stay on CPU unless explicitly requested otherwise.
++When original source intrinsics are missing, radial/fisheye recovery follows the useful calibration method in the reference implementation. Its parameters and held-out pixel residual are saved in the model output as `data_alignment.json`; a median residual over one pixel or fewer than 20 supporting validation matches is an error. Rectification happens in memory at the requested training resolution. Missing clean training targets are errors: original images never silently substitute for clean images. Intrinsics include the principal point and use COLMAP pixel centers at +0.5. Undistortion padding is excluded from training losses. Images stay as byte tensors on CPU unless explicitly requested otherwise; only the selected target is decoded to floating-point RGB. This avoids retaining the entire full-resolution dataset as float32 images.
+ 
+ ## Fields and deformation
+ 
+--- before/train.py
++++ after/train.py
+@@ -52,12 +52,17 @@
+ 
+ 
+ def load_field(path,args,field,extent,center,training=False):
+-    state=torch.load(path,map_location='cuda',weights_only=False)
++    state=torch.load(path,map_location='cpu',weights_only=False)
++    field_state=state['field']
++    field_state['params']={key:torch.nn.Parameter(value.detach().cuda(),requires_grad=training) for key,value in field_state['params'].items()}
++    for key in ('max_radii2D','xyz_gradient_accum','denom','last_update'):
++        field_state[key]=field_state[key].cuda()
++    if not training: field_state['optimizer']=None
+     pc=GaussianModel(args.sh_degree,args,field=field)
+     pc.restore(state['field'],args)
+     deformation=Deformation(pc.SCALE_DIM,args,center,extent).cuda()
+     deformation.load_state_dict(state['deformation'])
+-    deformation.optimizer=torch.optim.Adam(deformation.parameters(),lr=args.deform_lr)
++    deformation.optimizer=torch.optim.Adam(deformation.parameters(),lr=args.deform_lr) if training else None
+     if training: deformation.optimizer.load_state_dict(state['deform_optimizer'])
+     else:
+         pc.freeze();deformation.requires_grad_(False);deformation.eval()
+@@ -118,9 +123,8 @@
+     path=Path(args.model_path)/phase/'latest.pth'
+     start=0
+     if resume:
+-        state=torch.load(resume,map_location='cuda',weights_only=False)
++        pc,deformation,state=load_field(resume,args,phase,scene.cameras_extent,scene.center,True)
+         if state['phase']!=phase: raise ValueError('Resume phase does not match checkpoint.')
+-        pc,deformation,state=load_field(resume,args,phase,scene.cameras_extent,scene.center,True)
+         start=state['iteration']
+     else:
+         pc.training_setup(args)
+@@ -259,14 +263,15 @@
+     if args.init_points>args.max_interface_points or args.reflection_init_points>args.max_reflection_points:
+         raise ValueError('Initial point counts exceed their configured point caps.')
+     resume_phase=torch.load(args.resume,map_location='cpu',weights_only=False)['phase'] if args.resume else None
+-    if args.phase in ('all','interface') and resume_phase!='reflection':
++    trained_interface=args.phase in ('all','interface') and resume_phase!='reflection'
++    if trained_interface:
+         pc=GaussianModel(args.sh_degree,args)
+         pc.create_from_points(scene.point_cloud.points,srgb2linear(torch.as_tensor(scene.point_cloud.colors).float()).numpy(),scene.cameras_extent)
+         deformation=Deformation(2,args,scene.center,scene.cameras_extent).cuda()
+         interface,interface_deform,_=train_phase(scene,args,args,'interface',pc,deformation,resume=args.resume or None)
+     else:
+         interface,interface_deform,_=load_field(output/'interface/latest.pth',args,'interface',scene.cameras_extent,scene.center)
+-    interface.freeze();interface_deform.requires_grad_(False);interface_deform.eval()
++    interface.freeze();interface_deform.requires_grad_(False);interface_deform.eval();interface_deform.optimizer=None
+     geometry_path=output/'glass_geometry.json'
+     if args.glass_geometry:
+         raw=json.loads(Path(args.glass_geometry).read_text())
+@@ -274,7 +279,7 @@
+         quality={'source':'provided'}
+         validate_patches(records)
+         geometry_path.write_text(json.dumps({'patches':records,'quality':quality},indent=2))
+-    elif geometry_path.exists() and (args.resume or args.phase=='reflection'):
++    elif geometry_path.exists() and not trained_interface:
+         raw=json.loads(geometry_path.read_text());records,quality=raw['patches'],raw['quality']
+     else:
+         records,quality=extract_patches(scene.getTrainCameras(),interface,interface_deform,args,args,render_interface,scene.cameras_extent)
+@@ -288,6 +293,7 @@
+     for name in interface.PARAMS: getattr(interface,'_'+name).grad=None
+     for parameter in interface_deform.parameters(): parameter.grad=None
+     torch.cuda.empty_cache()
++    for camera in scene.getTrainCameras(): camera.clean_image=None
+     cache=DirectCache(interface,interface_deform,args,args.cache_views)
+     reflection=initialize_reflection(scene,interface,interface_deform,patches,args,args,cache) if resume_phase!='reflection' else GaussianModel(args.sh_degree,args,'reflection')
+     reflection_deform=Deformation(3,args,scene.center,scene.cameras_extent).cuda()

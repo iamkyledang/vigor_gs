@@ -1,0 +1,209 @@
+--- before/README.md
++++ after/README.md
+@@ -1,49 +1,71 @@
+ # VIGOR-GS
+ 
+-**Virtual-View Interface-Guided Optical Reflection Gaussian Splatting**
++Implementation of [framework.tex](framework.tex), replacing the inherited RT-Splatting mechanism in existing source files. Read [specification.md](specification.md) for the equations, approved geometry-extraction prior, renderer approximations, file mapping and validation status.
+ 
+-VIGOR-GS reconstructs scenes seen through glass using two Gaussian fields trained in two phases:
++The local environment is `.conda`. Commands below run from this folder and use its Python directly; activation is optional:
+ 
+-1. **Interface field (2DGS):** trained on reflection-removed images to recover the glass surface, which is then frozen and used to estimate the glass plane.
+-2. **Reflection field (3DGS):** trained on the original images and rendered from a virtual camera mirrored across the glass plane.
+-
+-At render time, the direct and reflected views are rasterized separately and blended per pixel with a Fresnel-guided weight. Refraction and multiple reflections are not modeled.
+-
+-## Installation
+-
+-```shell
+-conda create -n rtsplat python=3.10 -y
+-conda activate rtsplat
+-pip install -r requirements.txt
+-
+-pip install --no-build-isolation submodules/simple-knn
+-pip install --no-build-isolation submodules/diff-surfel-anych
+-
+-pip install --no-build-isolation git+https://github.com/NVlabs/nvdiffrast
++```bash
++cd /mnt/passport/Lighting_GS/VIGOR_GS
++# Optional: conda activate /mnt/passport/Lighting_GS/VIGOR_GS/.conda
+ ```
+ 
+-## Datasets
++## RTX 3060 6 GB quick test: train, render, metrics
+ 
+-Put your datasets under the `data` folder:
++This reduced configuration uses quarter resolution, smaller deformation MLPs and explicit point limits. It is intended for an approximately 1–2 hour trial; final runtime depends on the learned Gaussian/tile counts, GPU power and disk speed. Confirm the measured iteration rate in `output/vsgd0758_quick/*/training.jsonl`. It is a shorter quality experiment, not a converged benchmark.
+ 
+-```
+-data/
+-├── rt-splatting/
+-│   ├── van/
+-│   │   ├── images/
+-│   │   ├── sparse/
+-│   │   └── transparent_masks/
+-│   └── swab/
+-├── nerf-casting/
+-├── ...
++```bash
++.conda/bin/python train.py -s ../datasets/VSGD/0758 -m output/vsgd0758_quick -r 4 --iterations 6000 --reflection_iterations 6000 --init_points 30000 --reflection_init_points 20000 --max_interface_points 100000 --max_reflection_points 50000 --deform_depth 3 --deform_width 64 --warm_up 500 --surface_from_iter 500 --densify_until_iter 4000 --densification_interval 200 --position_lr_max_steps 6000 --checkpoint_interval 2000 --cache_views 8
++
++.conda/bin/python render.py -m output/vsgd0758_quick --skip_train --components
++
++.conda/bin/python metrics.py -m output/vsgd0758_quick
+ ```
+ 
+-## Training & Evaluation
++Training runs both sequential phases. If inferred glass geometry fails the coverage/precision checks, Phase II stops and the Phase I checkpoint plus `glass_geometry.json` remain available for inspection. Do not lower those checks merely to claim a successful reconstruction. Improve Phase I or supply reliable finite geometry with `--glass_geometry`.
+ 
+-```shell
+-sh eval.sh
++Outputs include `interface/latest.pth`, `reflection/latest.pth`, `glass_geometry.json`, `data_alignment.json`, `config.json`, training JSONL logs, rendered test components, `results.json`, and `per_view.json`. Final images and quantitative metrics are in sRGB; fitting and composition use linear RGB.
++
++## Full-resolution quality defaults
++
++Resolution defaults to **1**. The default configuration uses 30,000 iterations per phase, SH degree 3, 4-layer/128-wide deformation MLPs, 80,000 initial interface points, 50,000 initial reflection points, and caps of 500,000/250,000 points. These are quality-oriented starting defaults; their empirical optimum and comparative benchmark quality have not been established. Full-resolution runs may need more than 6 GB VRAM.
++
++```bash
++.conda/bin/python train.py -s ../datasets/VSGD/0758 -m output/vsgd0758_full
++.conda/bin/python render.py -m output/vsgd0758_full --skip_train --components
++.conda/bin/python metrics.py -m output/vsgd0758_full
+ ```
+ 
+-## Author
++## Resume and inspect
+ 
+-[@iamkyledang](https://github.com/iamkyledang)
++```bash
++# Continue either phase; saved model configuration is reused.
++.conda/bin/python train.py -s ../datasets/VSGD/0758 -m output/vsgd0758_quick --resume output/vsgd0758_quick/interface/latest.pth
++.conda/bin/python train.py -s ../datasets/VSGD/0758 -m output/vsgd0758_quick --resume output/vsgd0758_quick/reflection/latest.pth
++
++# Render Phase I without a reflection checkpoint.
++.conda/bin/python render.py -m output/vsgd0758_quick --direct_only --skip_train
++
++# Record implementation changes immediately, or continuously while editing.
++bash eval.sh --snapshot
++bash eval.sh --watch
++```
++
++The first resume command continues Phase I to its configured iteration count and then starts Phase II. The second resumes Phase II directly. Increase a phase length with `--iterations` or `--reflection_iterations`. Choose a fresh model directory for a separate experiment; existing checkpoints are protected from an accidental new training run.
++
++## Rebuild the CUDA extension
++
++The local compiled extension includes the existing 2DGS rasterizer and the new routed 3D Gaussian ray renderer. Rebuild after changing CUDA source:
++
++```bash
++cd submodules/diff-surfel-anych
++CUDA_HOME=../../.conda TORCH_CUDA_ARCH_LIST=8.6 MAX_JOBS=2 ../../.conda/bin/python setup.py build_ext --inplace
++cd ../..
++```
++
++Use an absolute `CUDA_HOME` if your compiler requires it. CUDA 11.8, Python 3.10, PyTorch 2.0.1+cu118 and a compatible C++ compiler are required by the prepared environment. The source submodule is selected at import time, leaving RT-Splatting's installed renderer intact.
++
++## Evaluation conventions
++
++`PSNR`, `SSIM` and standard-range `LPIPS` are full-image metrics. `Glass PSNR` normalizes by actual valid glass pixels. Separately labeled padded-mask metrics and `LPIPS (RT input)` retain the inherited baseline conventions for comparison; padding can inflate a masked PSNR. For a fair study, run both methods at the same resolution, split, alignment and metric convention. `--skip_lpips` explicitly omits LPIPS for a dependency smoke check; normal evaluation includes it.
++
++This is a research implementation. Refraction and recursive reflections are outside scope, and extracted glass depth is not guaranteed to be physically identifiable from clean RGB plus silhouettes.
+--- before/metrics.py
++++ after/metrics.py
+@@ -52,7 +52,8 @@
+                     'Masked PSNR (RT padded)':masked_psnr(pred*mask,target*mask,torch.ones_like(mask)),
+                     'Masked SSIM (RT padded)':float(ssim(pred*mask,target*mask)) if mask.any() else None}
+                 if perceptual is not None:
+-                    record['LPIPS']=float(perceptual(pred,target))
++                    record['LPIPS']=float(perceptual(pred*2-1,target*2-1))
++                    record['LPIPS (RT input)']=float(perceptual(pred,target))
+                     record['Masked LPIPS (RT padded)']=float(perceptual(pred*mask,target*mask)) if mask.any() else None
+                 values[path.name]=record
+             keys=next(iter(values.values())).keys()
+--- before/scene/cameras.py
++++ after/scene/cameras.py
+@@ -8,6 +8,7 @@
+     def __init__(self, info, data_device='cpu'):
+         self.uid = info.uid
+         self.colmap_id = info.uid
++        self.sensor_id = info.sensor_id
+         self.R, self.T = info.R, info.T
+         self.image_name = info.image_name
+         self.time, self.sequence = info.time, info.sequence
+--- before/scene/dataset_readers.py
++++ after/scene/dataset_readers.py
+@@ -131,7 +131,7 @@
+         # Exclude undistortion padding from all photometric and temporal objectives.
+         valid = (map_x >= 0) & (map_y >= 0) & (map_x <= source_size[0]-1) & (map_y <= source_size[1]-1)
+         R = qvec2rotmat(ext.qvec).T
+-        cameras.append(SimpleNamespace(uid=ext.id, R=R, T=np.array(ext.tvec), K=target_K,
++        cameras.append(SimpleNamespace(uid=ext.id, sensor_id=ext.camera_id, R=R, T=np.array(ext.tvec), K=target_K,
+             image=image, clean_image=clean, transparent_mask=mask, valid_mask=valid,
+             image_name=stem, width=width, height=height, time=float(record['time']),
+             sequence=record.get('source_clip','default'), split=split))
+--- before/specification.md
++++ after/specification.md
+@@ -91,7 +91,7 @@
+ 
+ `render.py` writes sRGB test renders, original ground truth, aligned glass masks and valid-pixel masks. `--components` also exports direct, reflection and alpha images. Test rendering uses the frozen 3D patches, never test glass masks for blending.
+ 
+-`metrics.py` streams one image at a time. It reports full-image PSNR/SSIM/LPIPS, valid-pixel PSNR, actual glass-pixel PSNR, opaque-pixel PSNR, and separately labeled padded-mask metrics matching the RT-Splatting protocol. Padded-mask PSNR includes zero-valued background pixels and is not a glass-only PSNR. Missing LPIPS weights are not silently ignored; `--skip_lpips` is an explicit smoke-test option.
++`metrics.py` streams one image at a time. It reports full-image PSNR/SSIM/LPIPS (standard LPIPS input range -1 to 1), a separately labeled LPIPS using the inherited RT input convention, valid-pixel PSNR, actual glass-pixel PSNR, opaque-pixel PSNR, and separately labeled padded-mask metrics matching the RT-Splatting protocol. Padded-mask PSNR includes zero-valued background pixels and is not a glass-only PSNR. Missing LPIPS weights are not silently ignored; `--skip_lpips` is an explicit smoke-test option.
+ 
+ ## Environment and implementation history
+ 
+@@ -102,3 +102,12 @@
+ ## Commands and validation
+ 
+ See `README.md` for the three-command quick test and the full-resolution defaults. Timing and GPU validation results are recorded here after checks finish. Research quality and improvements over the RT-Splatting baseline require completed, comparable training runs; they are not established by implementation checks.
++
++### Validation recorded during implementation
++
++- All 444 downloaded files verified by SHA-256 after copying.
++- CUDA extension built successfully for the RTX 3060 (SM 8.6) with the existing CUDA 11.8 / PyTorch 2.0.1 toolchain.
++- CUDA ray forward and backward checked against an independently expressed PyTorch reference on mixed-patch rays, including a Gaussian behind the ray origin. Maximum absolute gradient discrepancy: 7.16e-7 (opacity); other parameter gradients below 2.39e-7.
++- Empty tile lists and a nondefault CUDA stream passed.
++- Source-camera recovery: radial model; held-out training-frame median residual 0.15971 pixels, 348 supporting validation matches. All 117 training and 29 test frames loaded with aligned clean targets/masks.
++- End-to-end scene and local-environment checks: in progress.
+--- before/train.py
++++ after/train.py
+@@ -80,7 +80,7 @@
+ 
+ def previous_frames(cameras):
+     previous={};groups={}
+-    for cam in cameras: groups.setdefault(cam.sequence,[]).append(cam)
++    for cam in cameras: groups.setdefault((cam.sequence,getattr(cam,'sensor_id',0),cam.image_height,cam.image_width),[]).append(cam)
+     for views in groups.values():
+         views.sort(key=lambda c:c.time)
+         for i,cam in enumerate(views):
+@@ -122,8 +122,6 @@
+         if state['phase']!=phase: raise ValueError('Resume phase does not match checkpoint.')
+         pc,deformation,state=load_field(resume,args,phase,scene.cameras_extent,scene.center,True)
+         start=state['iteration']
+-        random.setstate(state['rng_python']);np.random.set_state(state['rng_numpy'])
+-        torch.set_rng_state(state['rng_torch'].cpu());torch.cuda.set_rng_state(state['rng_cuda'].cpu())
+     else:
+         pc.training_setup(args)
+         deformation.optimizer=torch.optim.Adam(deformation.parameters(),lr=args.deform_lr)
+@@ -134,6 +132,10 @@
+     if resume and optical is not None:
+         optical.load_state_dict(state['optical'])
+         if optical_optimizer and state.get('optical_optimizer'): optical_optimizer.load_state_dict(state['optical_optimizer'])
++    if resume:
++        # Restore after constructing all random-initialized modules.
++        random.setstate(state['rng_python']);np.random.set_state(state['rng_numpy'])
++        torch.set_rng_state(state['rng_torch'].cpu());torch.cuda.set_rng_state(state['rng_cuda'].cpu())
+     cameras=scene.getTrainCameras(); neighbors=previous_frames(cameras)
+     cache=DirectCache(interface,interface_deform,pipe,args.cache_views) if phase=='reflection' else None
+     history=Path(args.model_path)/phase/'training.jsonl';history.parent.mkdir(parents=True,exist_ok=True)
+@@ -233,6 +235,11 @@
+     if not args.source_path or not args.model_path: parser.error('-s and -m are required')
+     if args.checkpoint_interval<1 or args.report_interval<1 or args.cache_views<1: parser.error('Intervals/cache must be positive')
+     if args.eta_air<=0 or args.eta_glass<=0: parser.error('Refractive indices must be positive')
++    if args.sh_degree not in range(4): parser.error('SH degree must lie between zero and three')
++    if args.init_points<4 or args.reflection_init_points<4: parser.error('At least four initialization points per field are required')
++    if min(args.deform_depth,args.deform_width,args.max_patches,args.tile_size)<1: parser.error('Network, patch and tile dimensions must be positive')
++    if min(args.lambda_surface,args.lambda_motion,args.lambda_optical,args.lambda_glass,args.lambda_dssim)<0: parser.error('Loss weights must be nonnegative')
++    if args.plane_threshold<=0 or args.ray_cutoff<=0: parser.error('Geometry threshold and ray cutoff must be positive')
+     if not torch.cuda.is_available(): raise RuntimeError('A CUDA GPU and the VIGOR CUDA extension are required.')
+     args.source_path=str(Path(args.source_path).resolve());args.model_path=str(Path(args.model_path).resolve())
+     output=Path(args.model_path);output.mkdir(parents=True,exist_ok=True)

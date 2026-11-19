@@ -42,7 +42,7 @@ def srgb2linear(tensor_0to1):
     tensor_0to1 = torch.clamp(tensor_0to1, min=1e-10, max=1.0)
 
     tensor_linear = tensor_0to1 / srgb_linear_coeff
-    tensor_nonlinear = torch.pow(tensor_0to1 + (srgb_exponential_coeff - 1) / srgb_exponential_coeff, srgb_exponent)
+    tensor_nonlinear = torch.pow((tensor_0to1 + srgb_exponential_coeff - 1) / srgb_exponential_coeff, srgb_exponent)
 
     is_linear = tensor_0to1 <= srgb_linear_thres
     tensor_srgb = torch.where(is_linear, tensor_linear, tensor_nonlinear)

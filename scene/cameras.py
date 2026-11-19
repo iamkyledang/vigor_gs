@@ -1,89 +1,47 @@
-#
-# Copyright (C) 2023, Inria
-# GRAPHDECO research group, https://team.inria.fr/graphdeco
-# All rights reserved.
-#
-# This software is free for non-commercial, research and evaluation use
-# under the terms of the LICENSE.md file.
-#
-# For inquiries contact  george.drettakis@inria.fr
-#
-
+"""Calibrated camera. Large target tensors stay in host memory by default."""
 import numpy as np
 import torch
-from torch import nn
-
 from utils.graphics_utils import getProjectionMatrix, getWorld2View2
 
 
-class Camera(nn.Module):
-    def __init__(
-        self,
-        colmap_id,
-        R,
-        T,
-        FoVx,
-        FoVy,
-        image,
-        gt_alpha_mask,
-        gt_transparent_mask,
-        image_name,
-        uid,
-        trans=np.array([0.0, 0.0, 0.0]),
-        scale=1.0,
-        data_device='cuda',
-    ):
-        super(Camera, self).__init__()
+class Camera:
+    def __init__(self, info, data_device='cpu'):
+        self.uid = info.uid
+        self.colmap_id = info.uid
+        self.sensor_id = info.sensor_id
+        self.R, self.T = info.R, info.T
+        self.image_name = info.image_name
+        self.time, self.sequence = info.time, info.sequence
+        self.image_width, self.image_height = info.width, info.height
+        self.fx, self.fy = float(info.K[0,0]), float(info.K[1,1])
+        self.cx, self.cy = float(info.K[0,2]), float(info.K[1,2])
+        self.FoVx = 2*np.arctan(self.image_width/(2*self.fx))
+        self.FoVy = 2*np.arctan(self.image_height/(2*self.fy))
+        self.data_device = torch.device(data_device)
+        def tensor(image):
+            return torch.from_numpy(np.ascontiguousarray(image)).permute(2,0,1).to(self.data_device)
+        # Keep the dataset as bytes; decode only the sampled frame to float RGB.
+        self._original_image = tensor(info.image)
+        self._clean_image = tensor(info.clean_image) if info.clean_image is not None else None
+        self.gt_transparent_mask = torch.from_numpy(info.transparent_mask.copy())[None].to(self.data_device)
+        self.valid_mask = torch.from_numpy(info.valid_mask.copy())[None].to(self.data_device)
+        self.znear, self.zfar = 0.01, 1000.
+        self.world_view_transform = torch.tensor(getWorld2View2(self.R,self.T)).T.cuda()
+        projection = getProjectionMatrix(self.znear,self.zfar,self.FoVx,self.FoVy)
+        projection[0,2] = 2*self.cx/self.image_width-1
+        projection[1,2] = 2*self.cy/self.image_height-1
+        self.projection_matrix = projection.T.cuda()
+        self.full_proj_transform = self.world_view_transform @ self.projection_matrix
+        self.camera_center = self.world_view_transform.inverse()[3,:3]
 
-        self.uid = uid
-        self.colmap_id = colmap_id
-        self.R = R
-        self.T = T
-        self.FoVx = FoVx
-        self.FoVy = FoVy
-        self.image_name = image_name
+    @property
+    def original_image(self):
+        return self._original_image.float().div_(255)
 
-        try:
-            self.data_device = torch.device(data_device)
-        except Exception as e:
-            print(e)
-            print(f'[Warning] Custom device {data_device} failed, fallback to default cuda device')
-            self.data_device = torch.device('cuda')
+    @property
+    def clean_image(self):
+        return self._clean_image.float().div_(255) if self._clean_image is not None else None
 
-        self.original_image = image.clamp(0.0, 1.0).to(self.data_device)
-        self.image_width = self.original_image.shape[2]
-        self.image_height = self.original_image.shape[1]
-
-        self.gt_transparent_mask = gt_transparent_mask.to(self.data_device)
-
-        if gt_alpha_mask is not None:
-            self.gt_alpha_mask = gt_alpha_mask.to(self.data_device)
-        else:
-            self.original_image *= torch.ones((1, self.image_height, self.image_width), device=self.data_device)
-            self.gt_alpha_mask = None
-
-        self.zfar = 100.0
-        self.znear = 0.01
-
-        self.trans = trans
-        self.scale = scale
-
-        self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1).cuda()
-        self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0, 1).cuda()
-        self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
-        self.camera_center = self.world_view_transform.inverse()[3, :3]
-
-
-class MiniCam:
-    def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):
-        self.image_width = width
-        self.image_height = height
-        self.FoVy = fovy
-        self.FoVx = fovx
-        self.znear = znear
-        self.zfar = zfar
-        self.world_view_transform = world_view_transform
-        self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0, 1).cuda()
-        self.full_proj_transform = full_proj_transform
-        view_inv = torch.inverse(self.world_view_transform)
-        self.camera_center = view_inv[3][:3]
+    @clean_image.setter
+    def clean_image(self, value):
+        self._clean_image=None if value is None else value.detach().clamp(0,1).mul(255).round().byte().to(self.data_device)

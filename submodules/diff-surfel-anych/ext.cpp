@@ -13,6 +13,10 @@
 #include "rasterize_points.h"
 #include "cuda_rasterizer/config.h"
 
+
+std::vector<torch::Tensor> VigorRayForward(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int,int,int,float);
+std::vector<torch::Tensor> VigorRayBackward(torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,int,int,int,float);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #define X(N) \
   m.def("rasterize_gaussians_" #N, &RasterizeGaussiansCUDA<N>); \
@@ -20,4 +24,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 LIST_CHANNELS
 #undef X
   m.def("mark_visible", &markVisible);
+  m.def("vigor_ray_forward", &VigorRayForward);
+  m.def("vigor_ray_backward", &VigorRayBackward);
 }
