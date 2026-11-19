@@ -1,0 +1,10 @@
+--- before/specification.md
++++ after/specification.md
+@@ -124,6 +124,7 @@
+ ### Validation recorded during implementation
+ 
+ - Maintainability refactor: all 17 persistent `unittest` cases passed on the RTX 3060, including the CUDA reference gradients and exact next-step checkpoint continuation for both fields. Without GPU access, the 10 CPU cases pass and seven CUDA cases explicitly skip. AST comparison confirmed all 21 moved definitions retained their algorithm bodies, apart from deferring the two CUDA imports until rendering is called.
++- Existing version-1 VSGD checkpoints remained compatible after the split: all 116 PNGs (composite, direct, reflection and alpha across 29 test views) matched the pre-refactor images pixel for pixel. Both real phase loops resumed their old checkpoints from iteration 100 to 101 with finite losses and saved valid checkpoints in temporary storage; the benchmark run was left intact.
+ - All 444 downloaded files verified by SHA-256 after copying.
+ - CUDA extension built successfully for the RTX 3060 (SM 8.6) with the existing CUDA 11.8 / PyTorch 2.0.1 toolchain.
+ - CUDA ray forward and backward checked against an independently expressed PyTorch reference on mixed-patch rays, including a Gaussian behind the ray origin. Maximum absolute gradient discrepancy: 7.16e-7 (opacity); other parameter gradients below 2.39e-7.

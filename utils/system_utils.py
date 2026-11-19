@@ -44,7 +44,8 @@ def record_implementation_change(note='Implementation snapshot at training start
     state_file=folder/'implementation_state.json'
     previous=json.loads(state_file.read_text()) if state_file.exists() else {}
     current={}
-    for base in [root,root/'arguments',root/'scene',root/'gaussian_renderer',root/'utils',root/'submodules/diff-surfel-anych',root/'submodules/diff-surfel-anych/cuda_rasterizer',root/'submodules/simple-knn',root/'lpipsPyTorch',root/'lpipsPyTorch/modules']:
+    for base in [root,root/'arguments',root/'scene',root/'gaussian_renderer',root/'utils',root/'tests',root/'submodules/diff-surfel-anych',root/'submodules/diff-surfel-anych/cuda_rasterizer',root/'submodules/simple-knn',root/'lpipsPyTorch',root/'lpipsPyTorch/modules']:
+        if not base.exists(): continue
         for path in base.iterdir():
             if path.is_file() and (path.suffix in ('.py','.cu','.cpp','.h','.md','.tex','.txt','.toml','.sh') or path.name=='.gitignore'):
                 current[str(path.relative_to(root))]=path.read_text()

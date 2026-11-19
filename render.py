@@ -9,10 +9,10 @@ import torch
 from tqdm import tqdm
 
 from scene import Scene
-from scene.gaussian_model import OpticalCorrection
-from train import load_field
+from gaussian_renderer.composition import OpticalCorrection
+from utils.checkpoint_utils import load_field
 from gaussian_renderer import render_interface, render_composite
-from utils.point_utils import validate_patches
+from utils.glass_geometry import validate_patches
 from utils.color_utils import linear2srgb
 
 
@@ -51,7 +51,8 @@ def main():
         patches=validate_patches(json.loads((root/'glass_geometry.json').read_text())['patches'])
     if cli.iteration not in (-1,iteration):
         raise ValueError(f'Available saved checkpoint iteration is {iteration}; got {cli.iteration}.')
-    timing={}
+    stats_path=root/'render_stats.json'
+    timing=json.loads(stats_path.read_text()) if stats_path.exists() else {}
     for split,cameras,skip in [('train',scene.getTrainCameras(),cli.skip_train),('test',scene.getTestCameras(),cli.skip_test)]:
         if skip or not cameras: continue
         name=('direct_' if cli.direct_only else 'ours_')+str(iteration)
@@ -80,9 +81,11 @@ def main():
                 save_image(out['direct'],folder/'direct'/filename,linear=True)
                 save_image(out.get('reflection',torch.zeros_like(image)),folder/'reflection'/filename,linear=True)
                 save_image(out.get('alpha',torch.zeros_like(image[:1])),folder/'alpha'/filename)
-        timing[split]={'frames':len(cameras),'mean_ms':float(np.mean(milliseconds)),
+        mean_ms=float(np.mean(milliseconds))
+        timing[split]={'method':name,'frames':len(cameras),'mean_ms':mean_ms,'fps':1000/mean_ms,
             'peak_vram_mb':torch.cuda.max_memory_allocated()/2**20}
-    (root/'render_stats.json').write_text(json.dumps(timing,indent=2))
+        timing.setdefault('methods',{}).setdefault(split,{})[name]=timing[split].copy()
+    stats_path.write_text(json.dumps(timing,indent=2))
     print(json.dumps(timing,indent=2))
 
 

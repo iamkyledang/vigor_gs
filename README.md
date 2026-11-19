@@ -1,6 +1,6 @@
 # VIGOR-GS
 
-Implementation of [framework.tex](framework.tex), replacing the inherited RT-Splatting mechanism in existing source files. Read [specification.md](specification.md) for the equations, approved geometry-extraction prior, renderer approximations, file mapping and validation status.
+Implementation of [framework.tex](framework.tex), replacing the inherited RT-Splatting mechanism. Read [specification.md](specification.md) for the equations, approved geometry-extraction prior, renderer approximations, module reading order and validation status.
 
 The local environment is `.conda`. Commands below run from this folder and use its Python directly; activation is optional:
 
@@ -24,6 +24,12 @@ This reduced configuration uses quarter resolution, smaller deformation MLPs and
 Training runs both sequential phases. If inferred glass geometry fails the coverage/precision checks, Phase II stops and the Phase I checkpoint plus `glass_geometry.json` remain available for inspection. Do not lower those checks merely to claim a successful reconstruction. Improve Phase I or supply reliable finite geometry with `--glass_geometry`.
 
 Outputs include `interface/latest.pth`, `reflection/latest.pth`, `glass_geometry.json`, `data_alignment.json`, `config.json`, training JSONL logs, rendered test components, `results.json`, and `per_view.json`. Final images and quantitative metrics are in sRGB; fitting and composition use linear RGB.
+
+`results.json` also reports rendering `FPS` and total `Training Time` as `xx hours and xx mins`, with precise total/per-phase seconds. FPS excludes image saving; training time covers the optimization loops across both phases and resumed sessions. Unavailable timing is `null`. To update an existing result without recomputing PSNR/SSIM/LPIPS:
+
+```bash
+.conda/bin/python metrics.py -m output/vsgd0758_quick --performance_only
+```
 
 ## Full-resolution quality defaults
 
@@ -63,6 +69,16 @@ cd ../..
 ```
 
 Use an absolute `CUDA_HOME` if your compiler requires it. CUDA 11.8, Python 3.10, PyTorch 2.0.1+cu118 and a compatible C++ compiler are required by the prepared environment. The source submodule is selected at import time, leaving RT-Splatting's installed renderer intact.
+
+## Read and test the implementation
+
+The [module reading order](specification.md#module-responsibilities-and-reading-order) follows training through field storage, deformation, glass geometry, rendering, calibration and checkpoints. `train.py` retains phase scheduling and losses; `gaussian_renderer/__init__.py` exposes the rendering API. Checkpoint loading lives in `utils/checkpoint_utils.py` and is shared by training and rendering.
+
+```bash
+.conda/bin/python -m unittest discover -s tests -v
+```
+
+The tests use the standard library's `unittest`; no additional test dependency is needed. CPU checks cover geometry, tile coverage, calibration conventions and composition. CUDA checks compare reflected-ray outputs/gradients with an independent PyTorch reference and verify exact optimizer continuation, RNG restoration, frozen fields and point-cap behavior. GPU cases report skips if CUDA is unavailable. The refactor keeps the training/rendering/metrics commands and existing version-1 checkpoints compatible.
 
 ## Evaluation conventions
 

@@ -1,10 +1,10 @@
 # VIGOR-GS implementation specification
 
-This checkout implements `framework.tex` in the existing RT-Splatting source files. The original RT optical MLP mechanism has been replaced. Reference code from `../vigor_gs_viet_huynh` informed Gaussian storage, optimizer surgery and canonical deformation; no runtime imports depend on that checkout.
+This checkout implements `framework.tex` by replacing the inherited RT-Splatting mechanism. The implementation was initially kept in existing source files and subsequently split into the modules below with the user's approval. Reference code from `../vigor_gs_viet_huynh` informed Gaussian storage, optimizer surgery and canonical deformation; no runtime imports depend on that checkout.
 
 ## Decisions agreed with the user
 
-- Reuse existing implementation files. New source modules are not required.
+- Initially reuse existing implementation files. The user subsequently approved seven focused implementation modules and three regression-test files for maintainability.
 - `specification.md`, dated records under `log/`, runtime training/render outputs, and a local `.conda` environment are authorized.
 - Use **training** glass annotations to guide Phase I surface fitting. Extract finite 3D glass patches after Phase I and freeze them for Phase II. Test masks are used for reporting only.
 - The masks add an explicit supervised geometry prior beyond the original clean-RGB-only Phase I equation. They do not become learned plane assignments or inference blending masks.
@@ -23,7 +23,7 @@ When original source intrinsics are missing, radial/fisheye recovery follows the
 
 ## Fields and deformation
 
-`scene/gaussian_model.py` contains both independent Gaussian fields and their independent MLPs:
+`scene/gaussian_model.py` contains both independent Gaussian fields. `scene/deformation.py` supplies their independently instantiated geometry MLPs:
 
 - Interface: 2D disks, position, quaternion, two log scales, SH appearance, occupancy `p`, opacity `o`. The direct pass always uses `p * o`.
 - Reflection: 3D ellipsoids with three scales, independent appearance/opacity and independent optimizer state.
@@ -93,11 +93,35 @@ Point limits and tile-entry limits are enforced. Exceeding the tile budget produ
 
 `metrics.py` streams one image at a time. It reports full-image PSNR/SSIM/LPIPS (standard LPIPS input range -1 to 1), a separately labeled LPIPS using the inherited RT input convention, valid-pixel PSNR, actual glass-pixel PSNR, opaque-pixel PSNR, and separately labeled padded-mask metrics matching the RT-Splatting protocol. Padded-mask PSNR includes zero-valued background pixels and is not a glass-only PSNR. Missing LPIPS weights are not silently ignored; `--skip_lpips` is an explicit smoke-test option.
 
+Each method in `results.json` also includes `FPS`, `Training Time` (for example, `2 hours and 5 mins`), `Training Time (seconds)` and `Training Time by Phase (seconds)`. FPS is `1000 / mean_ms` from CUDA-event render timings for that method/split, excluding scene loading, checkpoint loading, PNG encoding and disk saving. `render_stats.json` retains timings by method and split so a direct-only render does not replace the composite timing. Legacy split-only timing is used only when a single matching method exists and its frame count agrees.
+
+Training time sums the final recorded wall-clock elapsed time of each optimization session across both phases; direct-only results count Phase I. This includes loop work and checkpoint writes, and excludes dataset loading, field/network initialization and glass extraction. New logs identify sessions explicitly, so resumed training accumulates correctly even when the new session takes longer than the old one. Legacy logs infer restarts from elapsed-time or iteration resets; historical resumes without either reset cannot be distinguished. Historical logs omit time after their last report, including the final checkpoint write. Missing measurements are written as `null`; whole minutes are truncated in the readable string while numeric seconds retain precision. For older rendered iterations, timing uses reports through that iteration in the corresponding phase, so unreported intervals cannot be recovered precisely.
+
+Use `.conda/bin/python metrics.py -m output/<run> --performance_only` to add or refresh these fields in an existing `results.json` while preserving image-quality scores and `per_view.json`.
+
 ## Environment and implementation history
 
 The project environment is `VIGOR_GS/.conda`, based on the existing Python 3.10 / PyTorch 2.0.1 CUDA 11.8 RT-Splatting environment. The project's own rebuilt CUDA extension is loaded from its existing submodule path, so installing it does not replace RT-Splatting's installed renderer. No tiny-cuda-nn or new 3D rasterizer submodule is needed.
 
 `log/` holds dated implementation notes, unified patches and the last source snapshot. Training automatically records any source change since the previous snapshot. For continuous logging while editing, run `bash eval.sh --watch` in another terminal. Use `bash eval.sh --snapshot` for an immediate snapshot. The watcher is optional and is not installed as a system service.
+
+## Module responsibilities and reading order
+
+Read the equations in `framework.tex`, then this document, followed by:
+
+1. `arguments/__init__.py`: model, rendering and optimization settings; defaults still use resolution 1.
+2. `train.py`: sequential phases, losses, freezing, direct-image cache and optimization schedule. Both phases remain together so their lifecycle is visible in one place.
+3. `scene/gaussian_model.py`: shared Gaussian storage, field-specific parameterization, Adam-state surgery, growth and pruning.
+4. `scene/deformation.py`: time-conditioned geometry network shared as a class, instantiated independently for each field.
+5. `gaussian_renderer/interface.py`: inherited 2DGS direct/surface rendering and normal validity.
+6. `utils/glass_geometry.py`: training-mask-guided patch extraction, finite-support validation, first-hit rays and virtual-camera control pose. Basic rays/depth/normals remain in `utils/point_utils.py`.
+7. `gaussian_renderer/reflection.py`: conservative sparse tile candidates and the routed reflected-ray render call. Its CUDA backend remains in the existing `submodules/diff-surfel-anych` extension.
+8. `gaussian_renderer/composition.py`: Fresnel weights, `OpticalCorrection`, ray-geometry assembly and linear-RGB composition. `gaussian_renderer/__init__.py` reexports the public rendering functions; CUDA imports are deferred until rendering is called.
+9. `scene/dataset_readers.py`, then `utils/calibration_utils.py`: pairing/time/splits and image loading, followed by distortion fitting, source-image matching and rectification helpers. Camera tensors remain in `scene/cameras.py`.
+10. `utils/checkpoint_utils.py`, then `render.py` and `metrics.py`: atomic checkpoint save/load and RNG restoration, inference/export, then quantitative evaluation. Rendering imports checkpoint utilities directly and does not import `train.py`.
+11. `tests/test_glass_geometry.py`, `tests/test_reflection_renderer.py`, `tests/test_checkpoint_resume.py`: regression checks for those contracts. Run `.conda/bin/python -m unittest discover -s tests -v` from this folder; GPU cases explicitly skip when CUDA is unavailable.
+
+The split preserves the version-1 checkpoint dictionary, parameter/state-dictionary names, CLI, loss expressions and CUDA sources. Restore RNG state after constructing all randomly initialized networks during resume. Source snapshots now include `tests/` as well as the implementation modules.
 
 ## Commands and validation
 
@@ -105,6 +129,9 @@ See `README.md` for the three-command quick test and the full-resolution default
 
 ### Validation recorded during implementation
 
+- Performance reporting: the expanded suite ran 22 tests, with 15 CPU cases passing and seven CUDA cases skipped without GPU access. Five added cases cover duration formatting, cumulative/resumed-session timing, method-specific/missing measurements, direct-only phase accounting and results export/refresh. The existing benchmark result was updated to 37.8125 FPS and 19.4578 recorded training seconds; all original image-quality scores and the bytes of `per_view.json` remained unchanged.
+- Maintainability refactor: all 17 persistent `unittest` cases passed on the RTX 3060, including the CUDA reference gradients and exact next-step checkpoint continuation for both fields. Without GPU access, the 10 CPU cases pass and seven CUDA cases explicitly skip. AST comparison confirmed all 21 moved definitions retained their algorithm bodies, apart from deferring the two CUDA imports until rendering is called.
+- Existing version-1 VSGD checkpoints remained compatible after the split: all 116 PNGs (composite, direct, reflection and alpha across 29 test views) matched the pre-refactor images pixel for pixel. Both real phase loops resumed their old checkpoints from iteration 100 to 101 with finite losses and saved valid checkpoints in temporary storage; the benchmark run was left intact.
 - All 444 downloaded files verified by SHA-256 after copying.
 - CUDA extension built successfully for the RTX 3060 (SM 8.6) with the existing CUDA 11.8 / PyTorch 2.0.1 toolchain.
 - CUDA ray forward and backward checked against an independently expressed PyTorch reference on mixed-patch rays, including a Gaussian behind the ray origin. Maximum absolute gradient discrepancy: 7.16e-7 (opacity); other parameter gradients below 2.39e-7.
