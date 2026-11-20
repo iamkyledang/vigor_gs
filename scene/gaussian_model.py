@@ -1,12 +1,16 @@
 """
-Shared machinery for the two VIGOR-GS Gaussian fields.
+The two canonical Gaussian fields of VIGOR-GS (Sec. 1):
 
-`GaussianField` owns everything that does not depend on whether the primitives are 2D disks or 3D ellipsoids:
-parameter storage, the optimizer and the surgery it needs when Gaussians are cloned, split or pruned, PLY
-persistence and checkpoints. Per-Gaussian parameters are listed once in `PARAMS`; a subclass that adds one only
-extends that tuple (plus its initial value and learning rate) and everything else follows.
+    G_I^0 = {(mu_i, q_i, s_i^(2), p_i, o_i, a_i)}   InterfaceField: 2D disks, occupancy p and opacity o, rendered with p * o
+    G_R^0 = {(mu_j, q_j, s_j^(3), o_j, a_j)}        ReflectionField: 3D ellipsoids, rendered with o
 
-Derived from the 3DGS / 2DGS `GaussianModel` (Inria GRAPHDECO, see LICENSE.md).
+The fields have independent parameters and optimizers. `GaussianField` holds what does not depend on the primitive
+type: parameter storage, the optimizer surgery that densification and pruning need, the 3DGS densification
+schedule and persistence. Per-Gaussian parameters are listed once in `PARAMS`; a subclass that adds one extends the
+tuple and provides its initial value and learning rate. Occupancy, opacity and appearance are canonical, so they
+are time independent; only geometry is deformed (scene/deformation.py).
+
+Derived from the 3DGS / 2DGS GaussianModel (Inria GRAPHDECO, see LICENSE.md).
 """
 
 import os
@@ -14,40 +18,31 @@ import os
 import numpy as np
 import torch
 from plyfile import PlyData, PlyElement
-
 from torch import nn
 
 from utils.general_utils import build_rotation, get_expon_lr_func, inverse_sigmoid
-from utils.graphics_utils import BasicPointCloud
 from utils.sh_utils import RGB2SH
-from utils.system_utils import mkdir_p
 
 
 class GaussianField:
     SCALE_DIM = 3
-    # Optimizer group names. The parameter for group `name` is stored as `self._<name>`.
-    PARAMS = ('xyz', 'f_dc', 'f_rest', 'opacity', 'scaling', 'rotation')
+    PARAMS = ('xyz', 'f_dc', 'f_rest', 'opacity', 'scaling', 'rotation')  # stored as self._<name>
     INIT_OPACITY = 0.1
     INIT_SCALE_FACTOR = 1.0  # multiplies the squared nearest-neighbor distance used for the initial scale
 
-    def __init__(self, sh_degree: int):
+    def __init__(self, sh_degree: int, max_points: int = 1_000_000):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
+        self.max_points = max_points
         for name in self.PARAMS:
             setattr(self, '_' + name, torch.empty(0))
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
-        self.last_update = torch.empty(0)
         self.optimizer = None
-        self.percent_dense = 0
-        self.spatial_lr_scale = 0
-
-        self.scaling_activation = torch.exp
-        self.scaling_inverse_activation = torch.log
-        self.opacity_activation = torch.sigmoid
-        self.inverse_opacity_activation = inverse_sigmoid
-        self.rotation_activation = torch.nn.functional.normalize
+        self.percent_dense = 0.0
+        self.spatial_lr_scale = 0.0
+        self.xyz_scheduler = None
 
     # ------------------------------------------------------------------ accessors
 
@@ -65,15 +60,20 @@ class GaussianField:
 
     @property
     def get_scaling(self):
-        return self.scaling_activation(self._scaling)
+        return torch.exp(self._scaling)
 
     @property
     def get_rotation(self):
-        return self.rotation_activation(self._rotation)
+        return nn.functional.normalize(self._rotation, dim=-1)
 
     @property
     def get_opacity(self):
-        return self.opacity_activation(self._opacity)
+        return torch.sigmoid(self._opacity)
+
+    @property
+    def get_presence(self):
+        """What densification prunes on and resets: the opacity here, the occupancy of the interface."""
+        return self.get_opacity
 
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
@@ -82,347 +82,310 @@ class GaussianField:
     # ------------------------------------------------------------------ initialization
 
     def _initial_rotation(self, num_points):
-        rots = torch.zeros((num_points, 4), device='cuda')
-        rots[:, 0] = 1
-        return rots
+        rotation = torch.zeros((num_points, 4), device='cuda')
+        rotation[:, 0] = 1
+        return rotation
 
     def _initial_extra_params(self, num_points):
-        """Initial raw values for the parameters a subclass adds to PARAMS."""
         return {}
 
     def create_from_points(self, points, colors, spatial_lr_scale: float):
-        """points: (N, 3) world positions, colors: (N, 3) RGB in [0, 1]."""
-        self.spatial_lr_scale = spatial_lr_scale
-        points = torch.as_tensor(np.asarray(points) if not torch.is_tensor(points) else points).float().cuda()
-        colors = torch.as_tensor(np.asarray(colors) if not torch.is_tensor(colors) else colors).float().cuda()
-        num_points = points.shape[0]
+        """points: (N, 3) world positions, colors: (N, 3) linear RGB (may exceed 1 for the reflection field)."""
+        from simple_knn._C import distCUDA2
 
+        self.spatial_lr_scale = spatial_lr_scale
+        points = torch.as_tensor(points, dtype=torch.float32).cuda()
+        colors = torch.as_tensor(colors, dtype=torch.float32).cuda()
+        num_points = points.shape[0]
         features = torch.zeros((num_points, 3, (self.max_sh_degree + 1) ** 2), device='cuda')
         features[:, :, 0] = RGB2SH(colors)
-
-        from simple_knn._C import distCUDA2
-        dist2 = torch.clamp_min(distCUDA2(points), 0.0000001) * self.INIT_SCALE_FACTOR
-        scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, self.SCALE_DIM)
-        opacities = self.inverse_opacity_activation(self.INIT_OPACITY * torch.ones((num_points, 1), device='cuda'))
-
+        dist2 = torch.clamp_min(distCUDA2(points), 1e-7) * self.INIT_SCALE_FACTOR
         initial = {
             'xyz': points,
             'f_dc': features[:, :, 0:1].transpose(1, 2).contiguous(),
             'f_rest': features[:, :, 1:].transpose(1, 2).contiguous(),
-            'opacity': opacities,
-            'scaling': scales,
+            'opacity': inverse_sigmoid(self.INIT_OPACITY * torch.ones((num_points, 1), device='cuda')),
+            'scaling': torch.log(torch.sqrt(dist2))[..., None].repeat(1, self.SCALE_DIM),
             'rotation': self._initial_rotation(num_points),
         }
         initial.update(self._initial_extra_params(num_points))
         for name in self.PARAMS:
             setattr(self, '_' + name, nn.Parameter(initial[name].requires_grad_(True)))
-        self.max_radii2D = torch.zeros((num_points), device='cuda')
-        print('Number of points at initialisation : ', num_points)
-
-    def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float):
-        self.create_from_points(pcd.points, pcd.colors, spatial_lr_scale)
+        self.max_radii2D = torch.zeros(num_points, device='cuda')
 
     # ------------------------------------------------------------------ optimization
 
-    def _learning_rates(self, training_args):
+    def _learning_rates(self, opt):
         return {
-            'xyz': training_args.position_lr_init * self.spatial_lr_scale,
-            'f_dc': training_args.feature_lr,
-            'f_rest': training_args.feature_lr / 20.0,
-            'opacity': training_args.opacity_lr,
-            'scaling': training_args.scaling_lr,
-            'rotation': training_args.rotation_lr,
+            'xyz': opt.position_lr_init * self.spatial_lr_scale,
+            'f_dc': opt.feature_lr,
+            'f_rest': opt.feature_lr / 20.0,
+            'opacity': opt.opacity_lr,
+            'scaling': opt.scaling_lr,
+            'rotation': opt.rotation_lr,
         }
 
-    def training_setup(self, training_args):
-        self.percent_dense = training_args.percent_dense
+    def training_setup(self, opt):
+        self.percent_dense = opt.percent_dense
         self._reset_densification_stats()
-        self.last_update = torch.zeros((self.num_points, 1), device='cuda', dtype=torch.int)
-
-        lrs = self._learning_rates(training_args)
-        groups = [{'params': [getattr(self, '_' + name)], 'lr': lrs[name], 'name': name} for name in self.PARAMS]
+        rates = self._learning_rates(opt)
+        groups = [{'params': [getattr(self, '_' + name)], 'lr': rates[name], 'name': name} for name in self.PARAMS]
         self.optimizer = torch.optim.Adam(groups, lr=0.0, eps=1e-15)
-        self.xyz_scheduler_args = get_expon_lr_func(
-            lr_init=training_args.position_lr_init * self.spatial_lr_scale,
-            lr_final=training_args.position_lr_final * self.spatial_lr_scale,
-            lr_delay_mult=training_args.position_lr_delay_mult,
-            max_steps=training_args.position_lr_max_steps,
-        )
+        self.xyz_scheduler = get_expon_lr_func(lr_init=opt.position_lr_init * self.spatial_lr_scale, lr_final=opt.position_lr_final * self.spatial_lr_scale,
+                                               lr_delay_mult=opt.position_lr_delay_mult, max_steps=opt.position_lr_max_steps)
 
     def update_learning_rate(self, iteration):
-        for param_group in self.optimizer.param_groups:
-            if param_group['name'] == 'xyz':
-                lr = self.xyz_scheduler_args(iteration)
-                param_group['lr'] = lr
-                return lr
+        for group in self.optimizer.param_groups:
+            if group['name'] == 'xyz':
+                group['lr'] = self.xyz_scheduler(iteration)
 
     def freeze(self):
-        """Turn the field into a constant: no gradients, no optimizer."""
+        """Turn the field into a constant: no gradients, no optimizer, no densification buffers."""
         for name in self.PARAMS:
-            getattr(self, '_' + name).requires_grad_(False)
+            setattr(self, '_' + name, getattr(self, '_' + name).detach().requires_grad_(False))
         self.optimizer = None
+        self.xyz_gradient_accum = self.denom = torch.empty(0)
 
     # ------------------------------------------------------------------ persistence
 
     def capture(self):
         return {
             'active_sh_degree': self.active_sh_degree,
-            'params': {name: getattr(self, '_' + name) for name in self.PARAMS},
+            'spatial_lr_scale': self.spatial_lr_scale,
+            'params': {name: getattr(self, '_' + name).detach() for name in self.PARAMS},
             'max_radii2D': self.max_radii2D,
             'xyz_gradient_accum': self.xyz_gradient_accum,
             'denom': self.denom,
-            'last_update': self.last_update,
             'optimizer': self.optimizer.state_dict() if self.optimizer is not None else None,
-            'spatial_lr_scale': self.spatial_lr_scale,
         }
 
-    def restore(self, state, training_args):
+    def restore(self, state, opt=None):
+        """Load a captured state; with `opt`, also rebuild the optimizer and its moments (resume)."""
         self.active_sh_degree = state['active_sh_degree']
         self.spatial_lr_scale = state['spatial_lr_scale']
         for name in self.PARAMS:
-            setattr(self, '_' + name, state['params'][name])
-        self.training_setup(training_args)
-        self.max_radii2D = state['max_radii2D']
-        self.xyz_gradient_accum = state['xyz_gradient_accum']
-        self.denom = state['denom']
-        self.last_update = state['last_update']
+            setattr(self, '_' + name, nn.Parameter(state['params'][name].cuda().requires_grad_(opt is not None)))
+        self.max_radii2D = state['max_radii2D'].cuda()
+        if opt is None:
+            self.freeze()
+            return
+        self.training_setup(opt)
+        self.xyz_gradient_accum = state['xyz_gradient_accum'].cuda()
+        self.denom = state['denom'].cuda()
         if state.get('optimizer') is not None:
             self.optimizer.load_state_dict(state['optimizer'])
 
-    def _param_dim(self, name):
-        if name == 'xyz':
-            return 3
-        if name == 'f_dc':
-            return 3
-        if name == 'f_rest':
-            return 3 * ((self.max_sh_degree + 1) ** 2 - 1)
-        if name == 'scaling':
-            return self.SCALE_DIM
-        if name == 'rotation':
-            return 4
-        return 1
-
-    @staticmethod
-    def _ply_names(name, dim):
-        if name == 'xyz':
-            return ['x', 'y', 'z']
-        prefix = {'scaling': 'scale', 'rotation': 'rot'}.get(name, name)
-        if dim == 1 and name not in ('f_dc', 'f_rest', 'scaling', 'rotation'):
-            return [prefix]
-        return ['{}_{}'.format(prefix, i) for i in range(dim)]
-
     def save_ply(self, path):
-        mkdir_p(os.path.dirname(path))
-
+        """Canonical field as a PLY in the 3DGS layout, for viewers."""
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         names, columns = [], []
         for name in self.PARAMS:
             tensor = getattr(self, '_' + name).detach()
             if name in ('f_dc', 'f_rest'):
-                tensor = tensor.transpose(1, 2).flatten(start_dim=1).contiguous()
-            columns.append(tensor.cpu().numpy())
-            names.extend(self._ply_names(name, columns[-1].shape[1]))
-            if name == 'xyz':  # viewers expect normals right after the position
+                tensor = tensor.transpose(1, 2).flatten(start_dim=1)
+            columns.append(tensor.cpu().numpy().reshape(self.num_points, -1))
+            prefix = {'scaling': 'scale', 'rotation': 'rot'}.get(name, name)
+            if name == 'xyz':
+                names += ['x', 'y', 'z']
                 columns.append(np.zeros_like(columns[-1]))
-                names.extend(['nx', 'ny', 'nz'])
-
-        elements = np.empty(self.num_points, dtype=[(attribute, 'f4') for attribute in names])
+                names += ['nx', 'ny', 'nz']
+            elif columns[-1].shape[1] == 1 and name not in ('scaling',):
+                names.append(prefix)
+            else:
+                names += [f'{prefix}_{i}' for i in range(columns[-1].shape[1])]
+        elements = np.empty(self.num_points, dtype=[(n, 'f4') for n in names])
         elements[:] = list(map(tuple, np.concatenate(columns, axis=1)))
         PlyData([PlyElement.describe(elements, 'vertex')]).write(path)
 
-    def load_ply(self, path):
-        vertex = PlyData.read(path).elements[0]
-        for name in self.PARAMS:
-            dim = self._param_dim(name)
-            values = np.stack([np.asarray(vertex[column]) for column in self._ply_names(name, dim)], axis=1) if dim > 0 else np.zeros((vertex.count, 0))
-            tensor = torch.tensor(values, dtype=torch.float, device='cuda')
-            if name in ('f_dc', 'f_rest'):
-                tensor = tensor.reshape(tensor.shape[0], 3, -1).transpose(1, 2).contiguous()
-            setattr(self, '_' + name, nn.Parameter(tensor.requires_grad_(True)))
-
-        self.active_sh_degree = self.max_sh_degree
-        self.max_radii2D = torch.zeros((self.num_points), device='cuda')
-        print('Load Path', path)
-
     # ------------------------------------------------------------------ optimizer surgery
 
-    def _sync_params(self, optimizable_tensors):
-        for name, tensor in optimizable_tensors.items():
+    def _set_params(self, tensors):
+        for name, tensor in tensors.items():
             setattr(self, '_' + name, tensor)
 
-    def replace_tensor_to_optimizer(self, tensor, name):
+    def _replace_in_optimizer(self, tensor, name):
+        """Swap the parameter `name` for `tensor`, zeroing its Adam moments."""
         for group in self.optimizer.param_groups:
             if group['name'] != name:
                 continue
-            stored_state = self.optimizer.state.get(group['params'][0], None)
-            if stored_state is not None:
-                stored_state['exp_avg'] = torch.zeros_like(tensor)
-                stored_state['exp_avg_sq'] = torch.zeros_like(tensor)
-                del self.optimizer.state[group['params'][0]]
+            state = self.optimizer.state.pop(group['params'][0], None)
             group['params'][0] = nn.Parameter(tensor.requires_grad_(True))
-            if stored_state is not None:
-                self.optimizer.state[group['params'][0]] = stored_state
-            self._sync_params({name: group['params'][0]})
+            if state is not None:
+                state['exp_avg'] = torch.zeros_like(tensor)
+                state['exp_avg_sq'] = torch.zeros_like(tensor)
+                self.optimizer.state[group['params'][0]] = state
+            self._set_params({name: group['params'][0]})
 
-    def _prune_optimizer(self, mask):
-        optimizable_tensors = {}
+    def _prune_optimizer(self, keep):
+        tensors = {}
         for group in self.optimizer.param_groups:
-            stored_state = self.optimizer.state.get(group['params'][0], None)
-            if stored_state is not None:
-                stored_state['exp_avg'] = stored_state['exp_avg'][mask]
-                stored_state['exp_avg_sq'] = stored_state['exp_avg_sq'][mask]
-                del self.optimizer.state[group['params'][0]]
-            group['params'][0] = nn.Parameter(group['params'][0][mask].requires_grad_(True))
-            if stored_state is not None:
-                self.optimizer.state[group['params'][0]] = stored_state
-            optimizable_tensors[group['name']] = group['params'][0]
-        return optimizable_tensors
+            state = self.optimizer.state.pop(group['params'][0], None)
+            group['params'][0] = nn.Parameter(group['params'][0][keep].requires_grad_(True))
+            if state is not None:
+                state['exp_avg'] = state['exp_avg'][keep]
+                state['exp_avg_sq'] = state['exp_avg_sq'][keep]
+                self.optimizer.state[group['params'][0]] = state
+            tensors[group['name']] = group['params'][0]
+        return tensors
 
-    def _cat_tensors_to_optimizer(self, tensors_dict):
-        optimizable_tensors = {}
+    def _extend_optimizer(self, new):
+        """Append new Gaussians; surviving Gaussians keep their Adam moments, new ones start at zero."""
+        tensors = {}
         for group in self.optimizer.param_groups:
-            extension_tensor = tensors_dict[group['name']]
-            stored_state = self.optimizer.state.get(group['params'][0], None)
-            if stored_state is not None:
-                stored_state['exp_avg'] = torch.cat((stored_state['exp_avg'], torch.zeros_like(extension_tensor)), dim=0)
-                stored_state['exp_avg_sq'] = torch.cat((stored_state['exp_avg_sq'], torch.zeros_like(extension_tensor)), dim=0)
-                del self.optimizer.state[group['params'][0]]
-            group['params'][0] = nn.Parameter(torch.cat((group['params'][0], extension_tensor), dim=0).requires_grad_(True))
-            if stored_state is not None:
-                self.optimizer.state[group['params'][0]] = stored_state
-            optimizable_tensors[group['name']] = group['params'][0]
-        return optimizable_tensors
+            extension = new[group['name']]
+            state = self.optimizer.state.pop(group['params'][0], None)
+            group['params'][0] = nn.Parameter(torch.cat((group['params'][0], extension), dim=0).requires_grad_(True))
+            if state is not None:
+                state['exp_avg'] = torch.cat((state['exp_avg'], torch.zeros_like(extension)), dim=0)
+                state['exp_avg_sq'] = torch.cat((state['exp_avg_sq'], torch.zeros_like(extension)), dim=0)
+                self.optimizer.state[group['params'][0]] = state
+            tensors[group['name']] = group['params'][0]
+        return tensors
 
     def _reset_densification_stats(self):
         self.xyz_gradient_accum = torch.zeros((self.num_points, 1), device='cuda')
         self.denom = torch.zeros((self.num_points, 1), device='cuda')
 
-    def prune_points(self, mask):
-        """Remove the Gaussians where `mask` is True."""
-        valid_points_mask = ~mask
-        self._sync_params(self._prune_optimizer(valid_points_mask))
-        self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
-        self.denom = self.denom[valid_points_mask]
-        self.last_update = self.last_update[valid_points_mask]
-        self.max_radii2D = self.max_radii2D[valid_points_mask]
+    def prune_points(self, remove):
+        keep = ~remove
+        self._set_params(self._prune_optimizer(keep))
+        self.xyz_gradient_accum = self.xyz_gradient_accum[keep]
+        self.denom = self.denom[keep]
+        self.max_radii2D = self.max_radii2D[keep]
 
-    def densification_postfix(self, new_params, new_last_update):
-        self._sync_params(self._cat_tensors_to_optimizer(new_params))
-        self.last_update = torch.cat((self.last_update, new_last_update), dim=0)
+    def _add_points(self, new):
+        self._set_params(self._extend_optimizer(new))
         self._reset_densification_stats()
-        self.max_radii2D = torch.zeros((self.num_points), device='cuda')
+        self.max_radii2D = torch.zeros(self.num_points, device='cuda')
 
-    # ------------------------------------------------------------------ densification
+    # ------------------------------------------------------------------ densification (3DGS schedule)
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
-        n_init_points = self.num_points
-        # Extract points that satisfy the gradient condition
-        padded_grad = torch.zeros((n_init_points), device='cuda')
-        padded_grad[: grads.shape[0]] = grads.squeeze()
-        selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
-        selected_pts_mask = torch.logical_and(selected_pts_mask, torch.max(self.get_scaling, dim=1).values > self.percent_dense * scene_extent)
+    def add_densification_stats(self, gradient_norm, visible):
+        """Accumulate a per-Gaussian positional gradient norm (screen space for disks, world space for rays)."""
+        self.xyz_gradient_accum[visible] += gradient_norm[visible]
+        self.denom[visible] += 1
 
-        new_params = {}
+    def update_max_radii(self, radii, visible):
+        self.max_radii2D[visible] = torch.max(self.max_radii2D[visible], radii[visible].float())
+
+    def _split(self, selected, N=2):
+        new = {}
         for name in self.PARAMS:
-            param = getattr(self, '_' + name)[selected_pts_mask]
-            new_params[name] = param.repeat(N, *([1] * (param.dim() - 1)))
-
-        stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
+            param = getattr(self, '_' + name)[selected]
+            new[name] = param.repeat(N, *([1] * (param.dim() - 1)))
+        stds = self.get_scaling[selected].repeat(N, 1)
         if self.SCALE_DIM == 2:  # a disk has no extent along its normal
             stds = torch.cat([stds, torch.zeros_like(stds[:, :1])], dim=-1)
         samples = torch.normal(mean=torch.zeros_like(stds), std=stds)
-        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N, 1, 1)
-        new_params['xyz'] = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
-        new_params['scaling'] = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N, 1) / (0.8 * N))
-
-        if not selected_pts_mask.any():
-            return
-        self.densification_postfix(new_params, self.last_update[selected_pts_mask].repeat(N, 1))
-
-        prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device='cuda', dtype=bool)))
-        self.prune_points(prune_filter)
-
-    def densify_and_clone(self, grads, grad_threshold, scene_extent):
-        # Extract points that satisfy the gradient condition
-        selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
-        selected_pts_mask = torch.logical_and(selected_pts_mask, torch.max(self.get_scaling, dim=1).values <= self.percent_dense * scene_extent)
-
-        if not selected_pts_mask.any():
-            return
-        new_params = {name: getattr(self, '_' + name)[selected_pts_mask] for name in self.PARAMS}
-        self.densification_postfix(new_params, self.last_update[selected_pts_mask])
+        rotations = build_rotation(self._rotation[selected]).repeat(N, 1, 1)
+        new['xyz'] = torch.bmm(rotations, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected].repeat(N, 1)
+        new['scaling'] = torch.log(self.get_scaling[selected].repeat(N, 1) / (0.8 * N))
+        self._add_points(new)
+        self.prune_points(torch.cat((selected, torch.zeros(N * int(selected.sum()), device='cuda', dtype=torch.bool))))
 
     def densify(self, max_grad, extent):
-        grads = self.xyz_gradient_accum / self.denom
-        grads[grads.isnan()] = 0.0
-        budget = max(0, getattr(self, 'max_points', 1000000) - self.num_points)
-        if budget == 0:
+        """Clone small and split large Gaussians with a large mean gradient, within the point budget."""
+        grads = (self.xyz_gradient_accum / self.denom).nan_to_num(0.0).squeeze(-1)
+        budget = self.max_points - self.num_points
+        if budget <= 0:
             return
-        scores = grads.flatten()
-        eligible = (scores >= max_grad).nonzero().flatten()
-        if eligible.numel() > budget:
-            keep = eligible[torch.topk(scores[eligible], budget).indices]
-            grads = torch.zeros_like(grads)
-            grads[keep] = scores[keep, None]
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        candidates = (grads >= max_grad).nonzero().squeeze(-1)
+        if candidates.numel() > budget:  # a clone and a split each add one Gaussian: keep the strongest
+            candidates = candidates[torch.topk(grads[candidates], budget).indices]
+        selected = torch.zeros_like(grads, dtype=torch.bool)
+        selected[candidates] = True
+        large = self.get_scaling.max(dim=1).values > self.percent_dense * extent
+        clone = selected & ~large
+        if clone.any():
+            self._add_points({name: getattr(self, '_' + name)[clone] for name in self.PARAMS})
+            selected = torch.cat([selected, torch.zeros(int(clone.sum()), device='cuda', dtype=torch.bool)])
+            large = torch.cat([large, torch.zeros(int(clone.sum()), device='cuda', dtype=torch.bool)])
+        split = selected & large
+        if split.any():
+            self._split(split)
 
-    def add_densification_stats(self, viewspace_point_tensor, update_filter, iteration):
-        if viewspace_point_tensor.grad is None:
-            return
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True)
-        self.denom[update_filter] += 1
-        self.last_update[update_filter] = iteration
+    def densify_and_prune(self, max_grad, min_presence, extent, max_screen_size=None, prune_large=False):
+        """
+        3DGS densification step. After the first presence reset (`prune_large`), Gaussians larger than 10% of the
+        scene extent are removed, and with `max_screen_size` also those whose screen radius exceeded it: without
+        this, a few huge Gaussians in wide scenes cover every tile and make the rasterizer buffers explode.
+        """
+        self.densify(max_grad, extent)
+        remove = (self.get_presence[:, 0] < min_presence) | ~torch.isfinite(self._xyz).all(-1)
+        if prune_large:
+            remove |= self.get_scaling.max(dim=1).values > 0.1 * extent
+            if max_screen_size:
+                remove |= self.max_radii2D > max_screen_size
+        if remove.all():
+            remove[self.get_presence[:, 0].argmax()] = False
+        self.prune_points(remove)
+        torch.cuda.empty_cache()
 
-    def _reset_activated(self, name, activation, inverse_activation, ceiling=0.01):
-        """Clamp an activated per-Gaussian value to at most `ceiling` and reset its optimizer state."""
-        raw = getattr(self, '_' + name)
-        for other in ('xyz', 'scaling', 'rotation', name):
-            raw.data[torch.isnan(getattr(self, '_' + other).data.mean(dim=-1))] = 0.0
-        activated = activation(raw)
-        self.replace_tensor_to_optimizer(inverse_activation(torch.min(activated, torch.ones_like(activated) * ceiling)), name)
+    def _presence_name(self):
+        return 'opacity'
 
-    def reset_opacity(self):
-        self._reset_activated('opacity', self.opacity_activation, self.inverse_opacity_activation)
+    def reset_presence(self, ceiling=0.01):
+        """Clamp the presence to `ceiling` (3DGS opacity reset), so Gaussians that are not needed get pruned."""
+        name = self._presence_name()
+        value = torch.sigmoid(getattr(self, '_' + name))
+        self._replace_in_optimizer(inverse_sigmoid(torch.clamp_max(value, ceiling)), name)
 
 
-class GaussianModel(GaussianField):
-    """RT-Splatting occupancy/opacity disks, or an independent 3D reflection field."""
-    def __init__(self, sh_degree, args=None, field='interface'):
-        self.field = field
-        self.SCALE_DIM = 2 if field == 'interface' else 3
-        self.PARAMS = ('xyz', 'f_dc', 'f_rest', 'opacity', 'scaling', 'rotation')
-        self.INIT_OPACITY = 0.5 if field == 'interface' else 0.1
-        self.INIT_SCALE_FACTOR = 0.1 if field == 'interface' else 1.0
-        if field == 'interface':
-            self.PARAMS += ('occupancy',)
-        super().__init__(sh_degree)
-        self.max_points = getattr(args, 'max_interface_points' if field == 'interface' else 'max_reflection_points', 500000)
+class InterfaceField(GaussianField):
+    """
+    G_I^0: 2D Gaussian disks with occupancy p (soft presence) and opacity o (given presence). The direct pass uses
+    p * o, as in RT-Splatting's 2DGS renderer. `factorized=False` is the ablation without the factorization: p = 1
+    for every disk and a single opacity plays both roles.
+    """
+
+    SCALE_DIM = 2
+    INIT_OPACITY = 0.5
+    INIT_OCCUPANCY = 0.1
+    INIT_SCALE_FACTOR = 0.1
+
+    def __init__(self, sh_degree, max_points=500_000, factorized=True):
+        self.factorized = factorized
+        self.PARAMS = GaussianField.PARAMS + (('occupancy',) if factorized else ())
+        super().__init__(sh_degree, max_points)
 
     @property
     def get_occupancy(self):
-        return torch.sigmoid(self._occupancy) if self.field == 'interface' else torch.ones_like(self._opacity)
+        if not self.factorized:
+            return torch.ones_like(self._opacity)
+        return torch.sigmoid(self._occupancy)
 
-    def _initial_extra_params(self, num_points):
-        if self.field == 'interface':
-            return {'occupancy': inverse_sigmoid(torch.full((num_points, 1), 0.1, device='cuda'))}
-        return {}
+    @property
+    def get_effective_opacity(self):
+        """p * o: the opacity of the direct image B_t (Eq. 2)."""
+        return self.get_occupancy * self.get_opacity
+
+    @property
+    def get_presence(self):
+        return self.get_occupancy if self.factorized else self.get_opacity
+
+    def _presence_name(self):
+        return 'occupancy' if self.factorized else 'opacity'
 
     def _initial_rotation(self, num_points):
-        if self.field == 'interface':
-            return torch.nn.functional.normalize(torch.randn(num_points, 4, device='cuda'), dim=-1)
-        return super()._initial_rotation(num_points)
+        return nn.functional.normalize(torch.randn((num_points, 4), device='cuda'), dim=-1)
 
-    def _learning_rates(self, args):
-        rates = super()._learning_rates(args)
-        rates['occupancy'] = args.occupancy_lr
+    def _initial_extra_params(self, num_points):
+        if not self.factorized:
+            return {}
+        return {'occupancy': inverse_sigmoid(self.INIT_OCCUPANCY * torch.ones((num_points, 1), device='cuda'))}
+
+    def _learning_rates(self, opt):
+        rates = super()._learning_rates(opt)
+        if self.factorized:
+            rates['occupancy'] = opt.occupancy_lr
         return rates
 
-    def densify_and_prune(self, threshold, extent, min_presence=0.005):
-        # Preserve screen sizes: optimizer surgery resets those buffers during growth.
-        self.densify(threshold, extent)
-        presence = self.get_occupancy if self.field == 'interface' else self.get_opacity
-        remove = (presence[:, 0] < min_presence) | ~torch.isfinite(self._xyz).all(-1)
-        remove |= self.get_scaling.max(-1).values > extent
-        if remove.all():
-            remove[presence[:, 0].argmax()] = False
-        self.prune_points(remove)
+
+class ReflectionField(GaussianField):
+    """G_R^0: 3D Gaussian ellipsoids, independent of G_I; queried along the reflected rays (Sec. 3)."""
+
+    SCALE_DIM = 3
+    INIT_OPACITY = 0.1
+
+    def __init__(self, sh_degree, max_points=250_000):
+        super().__init__(sh_degree, max_points)

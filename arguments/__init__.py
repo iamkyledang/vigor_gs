@@ -99,6 +99,9 @@ class InterfaceOptimizationParams(ParamGroup):
         self.densify_until_iter = 15000
         self.densification_interval = 100
         self.densify_grad_threshold = 0.0002
+        self.min_presence = 0.005  # prune disks whose occupancy falls below this
+        self.presence_reset_interval = 3000  # clamp the occupancy to 0.01 (2DGS/3DGS opacity reset); 0 disables it
+        self.max_screen_size = 20  # pixels; after the first reset, larger disks are pruned
         self.test_interval = 5000
         self.checkpoint_interval = 5000
         self.report_interval = 100
@@ -164,6 +167,8 @@ class ReflectionOptimizationParams(ParamGroup):
         self.densify_until_iter = 15000
         self.densification_interval = 100
         self.densify_grad_threshold = 0.00002  # on 3D position gradients (there is no screen space for rays)
+        self.min_presence = 0.005
+        self.presence_reset_interval = 3000
         self.cache_views = 32  # frozen direct renders kept in host RAM
         self.test_interval = 5000
         self.checkpoint_interval = 5000
