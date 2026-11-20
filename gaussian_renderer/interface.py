@@ -34,10 +34,11 @@ def _depth(maps, alpha, depth_ratio):
     return (1 - depth_ratio) * expected + depth_ratio * torch.nan_to_num(maps[5:6], 0.0, 0.0)
 
 
-def render_interface(view, field, deformation, pipe, surface=False, deforming=True, drop=None):
+def render_interface(view, field, deformation, pipe, surface=False, deforming=True, drop=None, deformed=None):
     """
     Render G_I(t) through the real camera `view` at `view.time`. `drop` (N,) bool removes those disks (used for the
-    occluder pass of the first-hit test, utils/model_io.DirectPass).
+    occluder pass of the first-hit test, utils/model_io.DirectPass); `deformed` reuses (centers, rotations, scales)
+    already computed for this time.
 
     Returns direct (3, H, W) linear RGB B_t, depth / alpha (1, H, W) of the direct pass, normal / depth_normal
     (3, H, W) world-space N_t and N_t^depth, surface_valid (1, H, W) the pixels where both are defined, and for
@@ -46,7 +47,7 @@ def render_interface(view, field, deformation, pipe, surface=False, deforming=Tr
     """
     from diff_surfel_anych import GaussianRasterizer
 
-    centers, rotations, scales = deformation(field, view.time, enabled=deforming)
+    centers, rotations, scales = deformed if deformed is not None else deformation(field, view.time, enabled=deforming)
     screen = torch.zeros_like(centers, requires_grad=True) + 0
     if screen.requires_grad:
         screen.retain_grad()

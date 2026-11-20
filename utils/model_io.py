@@ -57,14 +57,14 @@ class DirectPass:
 
     @torch.no_grad()
     def render(self, cam):
-        out = render_interface(cam, self.field, self.deformation, self.pipe)
+        deformed = self.deformation(self.field, cam.time)
+        out = render_interface(cam, self.field, self.deformation, self.pipe, deformed=deformed)
         entry = {'direct': out['direct'], 'depth': out['depth'], 'alpha': out['alpha']}
         entry['occluder_depth'], entry['occluder_alpha'] = out['depth'], out['alpha']
         if self.patches and self.margin > 0:
-            centers = self.deformation(self.field, cam.time)[0]
-            glass = on_patches(centers, self.patches, self.margin)
+            glass = on_patches(deformed[0], self.patches, self.margin)
             if glass.any():
-                occluder = render_interface(cam, self.field, self.deformation, self.pipe, drop=glass)
+                occluder = render_interface(cam, self.field, self.deformation, self.pipe, drop=glass, deformed=deformed)
                 entry['occluder_depth'], entry['occluder_alpha'] = occluder['depth'], occluder['alpha']
         return entry
 

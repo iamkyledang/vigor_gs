@@ -141,13 +141,18 @@ def test_extract_glass_with_known_and_extracted_geometry(trained_interface, synt
     assert record['quality']['coverage'] > 0.95 and record['quality']['precision'] > 0.95
     assert len(os.listdir(os.path.join(trained_interface, 'glass_preview'))) > 0
 
-    try:
-        extract_glass.main(['-m', trained_interface, '--plane_min_inliers', '50'])
-    except SystemExit:
-        pass  # a 300-iteration Phase I may not pass the quality gate; the record is written either way
-    record = json.load(open(os.path.join(trained_interface, 'glass_geometry.json')))
+    records = []
+    for _ in range(2):  # the extraction is deterministic
+        try:
+            extract_glass.main(['-m', trained_interface, '--plane_min_inliers', '50'])
+        except SystemExit:
+            pass  # a 300-iteration Phase I may not pass the quality gate; the record is written either way
+        records.append(json.load(open(os.path.join(trained_interface, 'glass_geometry.json'))))
+    record = records[-1]
     assert record['source'].startswith('phase_i') and len(record['patches']) >= 1
     assert 0 <= record['quality']['coverage'] <= 1
+    assert records[0]['patches'] == records[1]['patches']
+    assert record['settings']['glass_margin'] > 0
 
 
 def test_on_patches_selects_points_on_the_glass_layer_only():

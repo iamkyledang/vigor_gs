@@ -63,7 +63,7 @@ def extract(model_args, pipe, glass):
         records = patches_to_records(patches)
         source = os.path.abspath(glass.glass_geometry)
     else:
-        records, quality['samples'] = extract_patches(cameras, field, deformation, pipe, glass, render_interface, scene.extent)
+        records, quality['samples'] = extract_patches(cameras, field, deformation, pipe, glass, render_interface, scene.extent, model_args.seed)
         patches = validate_patches(records)
         source = f'phase_i_iteration_{iteration}'
     direct_pass = direct_pass_for(field, deformation, pipe, patches, settings)

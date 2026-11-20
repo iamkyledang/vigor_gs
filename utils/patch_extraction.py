@@ -30,8 +30,9 @@ def sample_views(cameras, count=12):
 
 
 @torch.no_grad()
-def glass_samples(views, field, deformation, pipe, render, per_view):
-    """World points of the annotated glass pixels where G_I has a present, transparent surface."""
+def glass_samples(views, field, deformation, pipe, render, per_view, seed=0):
+    """World points of the annotated glass pixels where G_I has a present, transparent surface (deterministic subsample)."""
+    generator = torch.Generator(device='cpu').manual_seed(seed)
     samples = []
     for cam in views:
         out = render(cam, field, deformation, pipe, surface=True)
@@ -39,7 +40,7 @@ def glass_samples(views, field, deformation, pipe, render, per_view):
         points = depths_to_points(cam, out['surface_depth'].permute(1, 2, 0))[keep]
         points = points[torch.isfinite(points).all(-1)]
         if len(points) > per_view:
-            points = points[torch.randperm(len(points), device=points.device)[:per_view]]
+            points = points[torch.randperm(len(points), generator=generator)[:per_view].to(points.device)]
         if len(points):
             samples.append(points.cpu().numpy())
     return np.concatenate(samples) if samples else np.zeros((0, 3))
@@ -137,16 +138,17 @@ def patch_quality(views, patches, epsilon, occlusion_for=None):
     return {'coverage': intersection / max(annotated, 1), 'precision': intersection / max(predicted, 1), 'views': len(views)}
 
 
-def extract_patches(cameras, field, deformation, pipe, glass, render, extent):
-    """Steps 1-3 and the orientation: (records, number of samples). Step 4 needs the patch-aware occluder pass."""
+def extract_patches(cameras, field, deformation, pipe, glass, render, extent, seed=0):
+    """Steps 1-3 and the orientation: (records, number of samples), the same for the same seed. Step 4 needs the
+    patch-aware occluder pass (extract_glass.py)."""
     views = sample_views(cameras)
-    points = glass_samples(views, field, deformation, pipe, render, max(200, glass.plane_max_points // len(views)))
+    points = glass_samples(views, field, deformation, pipe, render, max(200, glass.plane_max_points // len(views)), seed)
     if len(points) < glass.plane_min_inliers:
         raise RuntimeError(f'Phase I produced {len(points)} glass surface samples (need {glass.plane_min_inliers}): '
                            'supply known geometry with --glass_geometry, or train Phase I with the glass prior (--lambda_glass > 0)')
     if len(points) > glass.plane_max_points:
-        points = points[np.random.default_rng(0).choice(len(points), glass.plane_max_points, replace=False)]
-    records = fit_patches(points, glass.plane_threshold * extent, glass.plane_min_inliers, glass.max_patches)
+        points = points[np.random.default_rng(seed).choice(len(points), glass.plane_max_points, replace=False)]
+    records = fit_patches(points, glass.plane_threshold * extent, glass.plane_min_inliers, glass.max_patches, seed)
     if not records:
         raise RuntimeError('No glass plane with enough support was found; supply known geometry with --glass_geometry')
     return orient_toward_cameras(records, np.stack([cam.camera_center.cpu().numpy() for cam in cameras])), len(points)
