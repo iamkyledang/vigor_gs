@@ -18,8 +18,10 @@ CLEAN_COLOR = (64, 128, 192)
 
 
 @pytest.fixture(scope='module')
-def scene_info(scene_dir):
-    return readVigorSceneInfo(scene_dir, eval=True, clean_fallback_original=True)
+def scene_info(scene_dir, tmp_path_factory):
+    """The dev scene read without clean images (it may ship some), so the fallback to the originals is exercised."""
+    no_clean = tmp_path_factory.mktemp('no_clean')
+    return readVigorSceneInfo(scene_dir, eval=True, clean_images=str(no_clean), clean_fallback_original=True)
 
 
 @pytest.fixture(scope='module')

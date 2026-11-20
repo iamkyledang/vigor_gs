@@ -14,8 +14,8 @@ import torch
 
 from scene.cameras import Camera
 from utils.color_utils import srgb2linear
-from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
+from utils.memory_utils import DEFAULT_VRAM_FRACTION, image_to_tensor
 
 WARNED = False
 
@@ -59,24 +59,28 @@ def loadCam(args, id, cam_info, resolution_scale):
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
-    resized_image_rgb = PILtoTorch(cam_info.image, resolution)
-    gt_transparent_mask = PILtoTorch(cam_info.transparent_mask, resolution) > 0
+    # uint8 as decoded (the Camera converts on use, see utils/memory_utils.py); float in [0, 1] for other bit depths.
+    resized_image_rgb = image_to_tensor(cam_info.image, resolution)
+    gt_transparent_mask = image_to_tensor(cam_info.transparent_mask, resolution) > 0
 
     clean_image = None
     if getattr(cam_info, 'clean_image', None) is not None:
-        clean_image = PILtoTorch(cam_info.clean_image, resolution)[:3]
+        clean_image = image_to_tensor(cam_info.clean_image, resolution)[:3]
 
-    # The reflection blend is physically linear, so the VIGOR-GS pipeline trains on linear RGB.
-    if getattr(args, 'linear_rgb', False):
+    # The reflection blend is physically linear, so the VIGOR-GS pipeline trains on linear RGB. uint8 images are
+    # converted by the Camera when read; images that already are float are converted here.
+    linear_rgb = getattr(args, 'linear_rgb', False)
+    if linear_rgb and resized_image_rgb.dtype != torch.uint8:
         resized_image_rgb = torch.cat([srgb2linear(resized_image_rgb[:3]), resized_image_rgb[3:]], dim=0)
-        if clean_image is not None:
-            clean_image = srgb2linear(clean_image)
+    if linear_rgb and clean_image is not None and clean_image.dtype != torch.uint8:
+        clean_image = srgb2linear(clean_image)
 
     gt_image = resized_image_rgb
     loaded_mask = None
 
     if resized_image_rgb.shape[0] == 4:
-        loaded_mask = resized_image_rgb[3:4, ...]
+        alpha = resized_image_rgb[3:4, ...]
+        loaded_mask = alpha.float() / 255.0 if alpha.dtype == torch.uint8 else alpha
 
     return Camera(
         colmap_id=cam_info.uid,
@@ -92,6 +96,8 @@ def loadCam(args, id, cam_info, resolution_scale):
         data_device=args.data_device,
         time=getattr(cam_info, 'time', 0.0),
         clean_image=clean_image,
+        linear_rgb=linear_rgb,
+        data_vram_fraction=getattr(args, 'data_vram_fraction', DEFAULT_VRAM_FRACTION),
     )
 
 
@@ -99,6 +105,8 @@ def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
     for id, c in enumerate(cam_infos):
         camera_list.append(loadCam(args, id, c, resolution_scale))
+    if camera_list:
+        print('[ INFO ]', camera_list[0].placer.summary())
     return camera_list
 
 

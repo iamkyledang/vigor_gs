@@ -30,6 +30,7 @@ from scene.colmap_loader import (
 )
 from scene.gaussian_model import BasicPointCloud
 from utils.graphics_utils import focal2fov, fov2focal, getWorld2View2
+from utils.memory_utils import LazyImage
 from utils.sh_utils import SH2RGB
 
 
@@ -407,15 +408,16 @@ def readVigorSceneInfo(path, eval, clean_images='clean_image', clean_fallback_or
         else:
             raise ValueError(f'Colmap camera model not handled: {intr.model} (only PINHOLE or SIMPLE_PINHOLE are supported)')
 
+        # LazyImage: only the path and size are kept, so a large scene holds neither decoded pixels nor open files.
         image_path = os.path.join(images_dir, name)
-        image = Image.open(image_path)
+        image = LazyImage(image_path)
 
         mask_path = os.path.join(colmap_dir, 'masks', stem + '.png')
         if not os.path.exists(mask_path) and frame.get('source_mask'):
             mask_path = os.path.join(path, frame['source_mask'])
         if not os.path.exists(mask_path):
             raise FileNotFoundError(f'No glass mask for {name}: looked in {os.path.join(colmap_dir, "masks")} and at the frame\'s source_mask ({frame.get("source_mask")})')
-        transparent_mask = Image.open(mask_path).convert('L')
+        transparent_mask = LazyImage(mask_path, convert='L')
         if transparent_mask.size != image.size:
             mismatched_masks += 1
 
@@ -423,7 +425,7 @@ def readVigorSceneInfo(path, eval, clean_images='clean_image', clean_fallback_or
         split_name = frame.get('split') or ('train' if name in train_names else 'test')
         clean_path = None if ignore_clean_images else _find_clean_image(clean_dir, frame, split_name, stem)
         if clean_path is not None:
-            clean_image = Image.open(clean_path)
+            clean_image = LazyImage(clean_path)
             if clean_image.size != image.size:
                 mismatched_clean += 1
         elif not ignore_clean_images:

@@ -24,7 +24,6 @@ is how the single-field ablation (Phase I trained on the original images) is eva
 import os
 import sys
 from argparse import ArgumentParser
-from concurrent.futures import ThreadPoolExecutor
 
 import torch
 from tqdm import tqdm
@@ -33,6 +32,7 @@ from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer.vigor import render_composite, render_direct
 from utils.color_utils import linear2srgb
 from utils.general_utils import safe_state
+from utils.memory_utils import BoundedExecutor
 from utils.plane_utils import load_plane
 from utils.render_utils import save_img_u8
 from utils.vigor_utils import INTERFACE_DIR, PLANE_FILE, REFLECTION_DIR, load_interface, load_reflection
@@ -52,7 +52,7 @@ def render_set(out_dir, cameras, model, pipe, background, linear_rgb, use_gt_mas
             image = linear2srgb(image)
         return image.permute(1, 2, 0).squeeze(-1).cpu().numpy()
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with BoundedExecutor(max_workers=8, max_pending=32) as executor:  # bounded: pending images cannot fill the RAM
         for idx, cam in enumerate(tqdm(cameras, desc=f'Rendering {os.path.basename(os.path.dirname(out_dir))}')):
             direct_out = render_direct(cam, model['interface'], model['interface_deform'], pipe, background)
             glass_map = cam.gt_transparent_mask.cuda().float() if use_gt_mask else direct_out['glass_map']

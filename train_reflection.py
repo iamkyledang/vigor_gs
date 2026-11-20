@@ -33,6 +33,7 @@ from utils.fresnel import BlendModel, optical_loss
 from utils.general_utils import safe_state
 from utils.image_utils import psnr
 from utils.loss_utils import l1_loss, ssim
+from utils.memory_utils import get_placer
 from utils.plane_utils import load_plane
 from utils.vigor_utils import INTERFACE_DIR, PLANE_FILE, REFLECTION_DIR, load_interface, save_reflection
 
@@ -60,7 +61,9 @@ class DirectCache:
     """
     The frozen interface's direct image B_t and glass map for each training view, rendered once.
 
-    Phase I never changes during Phase II, so there is no reason to rasterize it again every iteration.
+    Phase I never changes during Phase II, so there is no reason to rasterize it again every iteration. The cache goes
+    through the cameras' placer (utils/memory_utils.py), so with --data_device auto it shares their VRAM budget and
+    whatever does not fit waits in pinned host RAM.
     """
 
     def __init__(self, cameras, interface, interface_deform, pipe, background, use_gt_mask=False):
@@ -68,7 +71,15 @@ class DirectCache:
         for cam in tqdm(cameras, desc='Rendering the frozen interface'):
             out = render_direct(cam, interface, interface_deform, pipe, background)
             glass_map = cam.gt_transparent_mask.float() if use_gt_mask else out['glass_map']
-            self.entries[cam.uid] = (out['direct'].to(cam.data_device), glass_map.to(cam.data_device))
+            placer = self._placer(cam)
+            self.entries[cam.uid] = (placer.place(out['direct'].detach()), placer.place(glass_map.detach()))
+        if cameras:
+            print('[ INFO ] with the cache of direct images,', self._placer(cameras[0]).summary())
+
+    @staticmethod
+    def _placer(cam):
+        """A scene camera's placer; bare cameras (e.g. MiniCam in tests) fall back to their data_device."""
+        return getattr(cam, 'placer', None) or get_placer(getattr(cam, 'data_device', 'cuda'))
 
     def __call__(self, cam):
         direct, glass_map = self.entries[cam.uid]

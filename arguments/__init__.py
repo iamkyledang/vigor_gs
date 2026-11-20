@@ -63,7 +63,8 @@ class ModelParams(ParamGroup):
         self._images = 'images'
         self._resolution = -1
         self._white_background = False
-        self.data_device = 'cuda'
+        self.data_device = 'cuda'  # per-view data on 'cuda', 'cpu' (pinned RAM) or 'auto' (GPU up to a budget), utils/memory_utils.py
+        self.data_vram_fraction = 0.35  # data_device='auto': share of the GPU memory the per-view data may take
         self.eval = False
 
         self.run_dim = 256
