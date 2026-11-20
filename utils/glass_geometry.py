@@ -9,9 +9,11 @@ The fixed glass patches and the per-pixel ray geometry of Sec. 3.
 
 "First visible" hit. Eq. (9) intersects the camera ray with the patches only, so a glass patch behind an opaque
 object (a pedestrian in front of a shop window) would still be selected and a reflection blended over the object.
-`first_hit` therefore also takes the depth of the frozen Phase I direct pass: a hit is dropped when the direct pass
-is opaque there and its depth lies in front of the glass. This uses the reconstructed geometry only (no learned
-mask, nothing trained); `occlusion=None` gives the literal Eq. (9) (ablation `--ablate_occlusion`).
+`first_hit` therefore also takes an occluder depth from the frozen Phase I field: a hit is dropped when that pass is
+opaque there and its depth lies in front of the glass. The occluder pass leaves out the disks that lie on the glass
+patches themselves (`on_patches`): they are the glass layer, possibly with leftovers that Phase I painted on it,
+never something in front of it. This uses the reconstructed geometry only (no learned mask, nothing trained);
+`occlusion=None` gives the literal Eq. (9) (ablation `--ablate_occlusion`).
 
 Patches are dicts {'normal': (3,), 'offset': (), 'vertices': (V, 3)} of tensors after `validate_patches`.
 """
@@ -77,6 +79,21 @@ def mirror_points(points, normal, offset):
 def _inside_polygon(points, vertices, normal):
     signs = torch.stack([(torch.cross((b - a).expand_as(points), points - a, dim=-1) * normal).sum(-1) for a, b in zip(vertices, vertices.roll(-1, 0))])
     return (signs >= -1e-6).all(0) | (signs <= 1e-6).all(0)
+
+
+def on_patches(points, patches, margin):
+    """(N,) bool: points within `margin` of a patch plane whose projection falls inside the patch polygon."""
+    hit = torch.zeros(points.shape[0], dtype=torch.bool, device=points.device)
+    for patch in patches:
+        n, d = patch['normal'], patch['offset']
+        signed = points @ n + d
+        near = signed.abs() < margin
+        if near.any():
+            projected = points[near] - signed[near, None] * n
+            inside = torch.zeros_like(near)
+            inside[near] = _inside_polygon(projected, patch['vertices'], n)
+            hit |= inside
+    return hit
 
 
 def first_hit(view, patches, epsilon=1e-4, occlusion=None):

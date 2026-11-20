@@ -26,12 +26,14 @@ from arguments import GlassParams, ModelParams, PipelineParams, load_model_args
 from gaussian_renderer.interface import render_interface
 from scene import Scene
 from utils.glass_geometry import first_hit, load_glass_geometry, patches_to_records, validate_patches
-from utils.model_io import GLASS_GEOMETRY, DirectPass, load_interface, occlusion_settings
+from utils.model_io import GLASS_GEOMETRY, direct_pass_for, load_interface, occlusion_settings
 from utils.patch_extraction import extract_patches, patch_quality, sample_views
 
 
-def settings_of(glass):
-    return {'occlusion_tolerance': glass.occlusion_tolerance, 'occlusion_alpha': glass.occlusion_alpha, 'ablate_occlusion': glass.ablate_occlusion}
+def settings_of(glass, extent):
+    """The first-hit rule stored with the patches. glass_margin: disks this close to a patch are the glass layer."""
+    return {'occlusion_tolerance': glass.occlusion_tolerance, 'occlusion_alpha': glass.occlusion_alpha, 'ablate_occlusion': glass.ablate_occlusion,
+            'glass_margin': glass.plane_threshold * extent}
 
 
 @torch.no_grad()
@@ -53,23 +55,21 @@ def write_previews(folder, views, patches, settings, direct_pass, epsilon):
 def extract(model_args, pipe, glass):
     scene = Scene(model_args, load_clean=False)
     field, deformation, iteration = load_interface(model_args, scene)
-    direct_pass = DirectPass(field, deformation, pipe)
-    settings = settings_of(glass)
+    settings = settings_of(glass, scene.extent)
     cameras = scene.getTrainCameras()
-
-    def occlusion_for(cam):
-        return occlusion_settings(settings, direct_pass(cam))
-
+    quality = {}
     if glass.glass_geometry:
         patches, _ = load_glass_geometry(glass.glass_geometry)
         records = patches_to_records(patches)
-        quality = patch_quality(sample_views(cameras), patches, pipe.ray_epsilon, occlusion_for)
-        source, accepted = os.path.abspath(glass.glass_geometry), True  # known geometry is trusted; its quality is reported only
+        source = os.path.abspath(glass.glass_geometry)
     else:
-        records, quality = extract_patches(cameras, field, deformation, pipe, glass, render_interface, scene.extent, pipe.ray_epsilon, occlusion_for)
+        records, quality['samples'] = extract_patches(cameras, field, deformation, pipe, glass, render_interface, scene.extent)
         patches = validate_patches(records)
         source = f'phase_i_iteration_{iteration}'
-        accepted = quality['coverage'] >= glass.plane_min_coverage and quality['precision'] >= glass.plane_min_precision
+    direct_pass = direct_pass_for(field, deformation, pipe, patches, settings)
+    quality.update(patch_quality(sample_views(cameras), patches, pipe.ray_epsilon, lambda cam: occlusion_settings(settings, direct_pass(cam))))
+    # Known geometry is trusted (its quality is reported only); extracted geometry must pass the checks.
+    accepted = bool(glass.glass_geometry) or (quality['coverage'] >= glass.plane_min_coverage and quality['precision'] >= glass.plane_min_precision)
     record = {'patches': records, 'settings': settings, 'quality': quality, 'source': source, 'accepted': bool(accepted)}
     with open(os.path.join(model_args.model_path, GLASS_GEOMETRY), 'w') as f:
         json.dump(record, f, indent=2)

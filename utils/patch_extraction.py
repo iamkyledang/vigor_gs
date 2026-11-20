@@ -21,7 +21,7 @@ glass with holes or curved glass needs known geometry (--glass_geometry).
 import numpy as np
 import torch
 
-from utils.glass_geometry import first_hit, validate_patches
+from utils.glass_geometry import first_hit
 from utils.point_utils import depths_to_points
 
 
@@ -137,8 +137,8 @@ def patch_quality(views, patches, epsilon, occlusion_for=None):
     return {'coverage': intersection / max(annotated, 1), 'precision': intersection / max(predicted, 1), 'views': len(views)}
 
 
-def extract_patches(cameras, field, deformation, pipe, glass, render, extent, epsilon, occlusion_for=None):
-    """Steps 1-4: (records, quality)."""
+def extract_patches(cameras, field, deformation, pipe, glass, render, extent):
+    """Steps 1-3 and the orientation: (records, number of samples). Step 4 needs the patch-aware occluder pass."""
     views = sample_views(cameras)
     points = glass_samples(views, field, deformation, pipe, render, max(200, glass.plane_max_points // len(views)))
     if len(points) < glass.plane_min_inliers:
@@ -149,7 +149,4 @@ def extract_patches(cameras, field, deformation, pipe, glass, render, extent, ep
     records = fit_patches(points, glass.plane_threshold * extent, glass.plane_min_inliers, glass.max_patches)
     if not records:
         raise RuntimeError('No glass plane with enough support was found; supply known geometry with --glass_geometry')
-    records = orient_toward_cameras(records, np.stack([cam.camera_center.cpu().numpy() for cam in cameras]))
-    quality = patch_quality(views, validate_patches(records), epsilon, occlusion_for)
-    quality['samples'] = len(points)
-    return records, quality
+    return orient_toward_cameras(records, np.stack([cam.camera_center.cpu().numpy() for cam in cameras])), len(points)

@@ -148,3 +148,15 @@ def test_extract_glass_with_known_and_extracted_geometry(trained_interface, synt
     record = json.load(open(os.path.join(trained_interface, 'glass_geometry.json')))
     assert record['source'].startswith('phase_i') and len(record['patches']) >= 1
     assert 0 <= record['quality']['coverage'] <= 1
+
+
+def test_on_patches_selects_points_on_the_glass_layer_only():
+    from utils.glass_geometry import on_patches
+
+    patches = validate_patches([square(0.0, half=1.0), square(2.0, half=0.5)], device='cpu')
+    points = torch.tensor([[0.2, 0.3, 0.005],   # on the first pane
+                           [0.2, 0.3, 0.2],     # in front of it: an occluder candidate
+                           [1.5, 0.0, 0.0],     # on its plane but outside the polygon
+                           [0.1, -0.1, 1.999],  # on the second pane
+                           [0.9, 0.0, 2.0]])    # outside the second pane
+    assert on_patches(points, patches, margin=0.01).tolist() == [True, False, False, True, False]

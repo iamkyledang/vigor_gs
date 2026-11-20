@@ -36,7 +36,7 @@ from scene.deformation import Deformation
 from scene.gaussian_model import ReflectionField
 from utils.checkpoint_utils import load_checkpoint, restore_phase
 from utils.color_utils import linear2srgb
-from utils.model_io import DirectPass, load_glass, load_interface
+from utils.model_io import direct_pass_for, load_glass, load_interface
 
 PATCH_COLORS = np.array([[230, 25, 75], [60, 180, 75], [255, 225, 25], [0, 130, 200], [245, 130, 48], [145, 30, 180], [70, 240, 240], [240, 50, 230]], np.uint8)
 
@@ -131,7 +131,7 @@ def render_sets(model_args, skip_train=False, skip_test=False, components=False,
         settings = glass_record.get('settings', {'ablate_occlusion': True})
         pipe = config
         name = f'ours_{iteration}'
-    direct_pass = DirectPass(interface, interface_deformation, pipe, capacity=1)  # every frame is rendered, not cached
+        direct_pass = direct_pass_for(interface, interface_deformation, pipe, patches, settings, capacity=1)  # every frame rendered, not cached
 
     stats_path = root / 'render_stats.json'
     stats = json.loads(stats_path.read_text()) if stats_path.exists() else {}

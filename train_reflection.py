@@ -34,7 +34,7 @@ from utils.checkpoint_utils import load_checkpoint, restore_phase, restore_rng_s
 from utils.glass_geometry import first_hit
 from utils.image_utils import masked_psnr
 from utils.losses import dssim, motion_loss, optical_loss, pixel_l1
-from utils.model_io import DirectPass, load_glass, load_interface, occlusion_settings
+from utils.model_io import direct_pass_for, load_glass, load_interface, occlusion_settings
 from utils.run_utils import TrainingLog, ViewSampler, phase_dir, seed_everything
 
 PHASE = 'reflection'
@@ -133,7 +133,7 @@ def training(model_args, pipe, params, opt, resume=False, quiet=False):
 
     scene = Scene(model_args, load_clean=False)
     interface, interface_deformation, _ = load_interface(model_args, scene)
-    direct_pass = DirectPass(interface, interface_deformation, pipe, opt.cache_views)
+    direct_pass = direct_pass_for(interface, interface_deformation, pipe, patches, settings, opt.cache_views)
     field, deformation, optical, constant = build_reflection(model_args, params, scene)
     blend_parameters = [p for module in (optical, constant) if module is not None for p in module.parameters()]
     blend_optimizer = torch.optim.Adam(blend_parameters, lr=opt.optical_lr) if blend_parameters else None

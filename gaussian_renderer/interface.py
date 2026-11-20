@@ -34,9 +34,10 @@ def _depth(maps, alpha, depth_ratio):
     return (1 - depth_ratio) * expected + depth_ratio * torch.nan_to_num(maps[5:6], 0.0, 0.0)
 
 
-def render_interface(view, field, deformation, pipe, surface=False, deforming=True):
+def render_interface(view, field, deformation, pipe, surface=False, deforming=True, drop=None):
     """
-    Render G_I(t) through the real camera `view` at `view.time`.
+    Render G_I(t) through the real camera `view` at `view.time`. `drop` (N,) bool removes those disks (used for the
+    occluder pass of the first-hit test, utils/model_io.DirectPass).
 
     Returns direct (3, H, W) linear RGB B_t, depth / alpha (1, H, W) of the direct pass, normal / depth_normal
     (3, H, W) world-space N_t and N_t^depth, surface_valid (1, H, W) the pixels where both are defined, and for
@@ -55,7 +56,8 @@ def render_interface(view, field, deformation, pipe, surface=False, deforming=Tr
         return rasterizer(means3D=centers, means2D=screen, shs=field.get_features, extras=extras, opacities=opacity,
                           scales=scales, rotations=rotations, cov3D_precomp=None)
 
-    direct, _, radii, maps = rasterize(field.get_effective_opacity)
+    opacity = field.get_effective_opacity if drop is None else field.get_effective_opacity * (~drop)[:, None]
+    direct, _, radii, maps = rasterize(opacity)
     alpha = maps[1:2]
     depth = _depth(maps, alpha, pipe.depth_ratio)
     # Camera-space normals to world space (row-vector convention: world_view_transform[:3, :3] is camera-to-world).
