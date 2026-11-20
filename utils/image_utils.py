@@ -23,6 +23,15 @@ def psnr(img1, img2):
     return 20 * torch.log10(1.0 / torch.sqrt(mse))
 
 
+def masked_psnr(prediction, target, mask):
+    """PSNR over the pixels where `mask` (1, H, W) is True, all channels; None when the mask is empty."""
+    count = mask.sum() * prediction.shape[0]
+    if count == 0:
+        return None
+    mse = ((prediction - target).square() * mask).sum() / count
+    return float(-10 * torch.log10(mse.clamp_min(1e-12)))
+
+
 def apply_colormap(image, cmap='turbo'):
     colormap = matplotlib.colormaps[cmap]
     return torch.tensor(colormap(image.squeeze(0).cpu().numpy())[..., :3]).permute(2, 0, 1)

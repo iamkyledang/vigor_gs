@@ -29,7 +29,7 @@
 
 // distortion helper macros
 #define BACKFACE_CULL 1
-#define DUAL_VISIABLE 0
+#define DUAL_VISIABLE 1  // 2DGS: each disk normal faces the camera (RT-Splatting set 0); needed by the L1 surface loss of Eq. (3a)
 // #define NEAR_PLANE 0.2
 // #define FAR_PLANE 100.0
 #define DETACH_WEIGHT 0

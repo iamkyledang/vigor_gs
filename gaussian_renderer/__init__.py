@@ -1,19 +1,18 @@
-"""Public rendering API for the direct and reflected VIGOR-GS fields."""
+"""
+Renderers of the two VIGOR-GS fields:
+
+    interface.py     2DGS direct and surface passes of G_I (Eq. 2)
+    reflection.py    G_R along per-pixel reflected rays (Sec. 3, "Render")
+    composition.py   Fresnel weight, optical correction h_psi and the blend of Eq. (6)
+
+The CUDA extension is the one built in this checkout's submodules/diff-surfel-anych (`setup.py build_ext
+--inplace`): it adds the reflected-ray renderer to the 2DGS rasterizer. Putting its folder first on sys.path keeps
+an older diff_surfel_anych installed in the environment (e.g. for RT-Splatting) untouched.
+"""
+
+import os
 import sys
-from pathlib import Path
 
-# Select this checkout's extension. CUDA is loaded only when rendering is called,
-# so CPU geometry tests and optical-network imports do not require a built backend.
-_extension_path = str(Path(__file__).resolve().parents[1] / 'submodules/diff-surfel-anych')
-if _extension_path not in sys.path:
-    sys.path.insert(0, _extension_path)
-
-from gaussian_renderer.interface import render_interface
-from gaussian_renderer.reflection import tile_candidates, render_reflection
-from gaussian_renderer.composition import OpticalCorrection, ray_geometry, render_composite
-from scene.gaussian_model import GaussianModel
-
-render = render_interface
-
-__all__ = ['render', 'render_interface', 'render_reflection', 'render_composite',
-           'tile_candidates', 'ray_geometry', 'OpticalCorrection', 'GaussianModel']
+_EXTENSION = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'submodules', 'diff-surfel-anych')
+if _EXTENSION not in sys.path:
+    sys.path.insert(0, _EXTENSION)
