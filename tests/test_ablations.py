@@ -295,6 +295,36 @@ def test_shared_field_with_learned_constant_trains_only_the_blend(model_copy, tr
 
 
 @pytest.mark.data
+@pytest.mark.parametrize('ablation', [None, 'shared_reflection_field', 'ablate_fresnel', 'ablate_virtual_camera'])
+def test_fresnel_mlp_trains_saves_and_renders_with_each_ablation(model_copy, trained_interface, ablation):
+    """The *_mlp variants of the Colab suite: --optical_correction on top of the full model and of each Phase II ablation."""
+    from pathlib import Path
+
+    from render_vigor import render_sets
+    from train_reflection import training
+    from utils.vigor_utils import load_reflection
+
+    model_copy.optical_correction = True
+    if ablation:
+        setattr(model_copy, ablation, True)
+    argv = ['--iterations', '30', '--warm_up', '15', '--refl_init_points', '2000', '--optical_lr', '0.05']
+    history = training(model_copy, reflection_opt(argv), trained_interface.pipe, testing_iterations=[30], saving_iterations=[30])
+    final = next(h for h in history if h['split'] == 'test')
+    assert final['iteration'] == 30 and torch.isfinite(torch.tensor(final['psnr']))  # with h_psi even the shared field trains
+
+    reflection_dir = Path(model_copy.model_path) / 'reflection'
+    saved = eval(open(reflection_dir / 'cfg_args').read(), {'Namespace': Namespace})  # what render_vigor.py reads back
+    assert saved.optical_correction and (ablation is None or getattr(saved, ablation))
+    _, _, blend, iteration = load_reflection(model_copy)
+    assert iteration == 30 and blend.correction is not None
+    assert blend.correction.head.weight.abs().sum() > 0  # h_psi starts at zero, so it moved
+    assert (blend.constant_logit is not None) == (ablation == 'ablate_fresnel')
+
+    label = render_sets(model_copy, trained_interface.pipe, skip_train=True)
+    assert label == 'ours_30' and (Path(model_copy.model_path) / 'test' / label / 'vis' / 'reflection_contribution_00000.png').exists()
+
+
+@pytest.mark.data
 def test_phase_two_without_the_virtual_camera_runs(model_copy, trained_interface):
     from train_reflection import training
 
