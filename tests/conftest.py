@@ -34,6 +34,24 @@ def synthetic_scene(tmp_path_factory):
     return Namespace(path=str(root), **truth)
 
 
+SMALL = ['--deform_depth', '2', '--deform_width', '32', '--quiet']
+
+
+@pytest.fixture(scope='session')
+def trained_interface(synthetic_scene, tmp_path_factory):
+    """
+    Model folder with a short Phase I (300 iterations, small deformation MLP) on the synthetic scene, shared by
+    the tests of the later steps. They must not change its interface/ folder.
+    """
+    import train_interface
+
+    model = str(tmp_path_factory.mktemp('model'))
+    train_interface.main(['-s', synthetic_scene.path, '-m', model, '--iterations', '300', '--warm_up', '100', '--surface_from_iter', '50',
+                          '--densify_from_iter', '50', '--densification_interval', '50', '--test_interval', '300',
+                          '--checkpoint_interval', '300', '--presence_reset_interval', '0'] + SMALL)
+    return model
+
+
 def model_args(source_path, model_path='', **overrides):
     """A complete ModelParams namespace with its defaults, for tests that build a Scene directly."""
     from argparse import ArgumentParser

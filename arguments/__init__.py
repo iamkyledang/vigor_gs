@@ -109,7 +109,7 @@ class InterfaceOptimizationParams(ParamGroup):
 
 
 class GlassParams(ParamGroup):
-    """The fixed glass patches P = {(n_k, d_k, S_k)} of Sec. 1."""
+    """The fixed glass patches P = {(n_k, d_k, S_k)} of Sec. 1 and the first-hit rule of Eq. (9); stored in glass_geometry.json."""
 
     def __init__(self, parser):
         self.glass_geometry = ''  # known patches (JSON); empty = extract them from the Phase I geometry
@@ -119,6 +119,11 @@ class GlassParams(ParamGroup):
         self.plane_max_points = 12000  # surface samples used by RANSAC
         self.plane_min_coverage = 0.5  # refuse patches that miss more than half of the annotated glass
         self.plane_min_precision = 0.5  # or that put glass where the annotation has none
+        # First visible hit (Eq. 9): a glass hit is dropped when the frozen direct pass is opaque there (alpha at
+        # least occlusion_alpha) and its depth is in front of the glass by more than occlusion_tolerance (relative).
+        self.occlusion_tolerance = 0.02
+        self.occlusion_alpha = 0.5
+        self.ablate_occlusion = False  # literal Eq. (9): only the patches decide
         super().__init__(parser, 'Glass patches')
 
 
@@ -132,10 +137,7 @@ class ReflectionParams(ParamGroup):
         self.eta_glass = 1.5
         self.pure_fresnel = False  # h_psi = 0 (Eq. 11 without the learned correction)
         self.optical_bound = 0.0  # > 0 bounds h_psi to +-bound with tanh; 0 = unbounded, as in Eq. (11)
-        self.occlusion_tolerance = 0.02  # a glass hit is occluded when the frozen depth is this fraction in front of it
-        self.occlusion_alpha = 0.5  # ... and the frozen direct pass is at least this opaque there
         # Ablations of Phase II.
-        self.ablate_occlusion = False  # literal Eq. (9): glass hits are not tested against the frozen G_I depth
         self.ablate_virtual_camera = False  # G_R is queried along the unreflected real rays
         self.pinhole_virtual_camera = False  # rays start at the Eq. (9b) pose c_v instead of each glass hit
         self.ablate_fresnel = False  # alpha is one learned constant on the glass instead of F(theta) + h_psi

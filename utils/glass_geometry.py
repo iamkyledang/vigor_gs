@@ -1,158 +1,159 @@
-"""Finite glass supports, first-hit rays, control poses and Phase I extraction."""
-import numpy as np
+"""
+The fixed glass patches and the per-pixel ray geometry of Sec. 3.
+
+    P = {Pi_k = (n_k, d_k, S_k)}, n_k^T x + d_k = 0, ||n_k|| = 1     Sec. 1; S_k a convex polygon on the plane
+    Pi_t(u) = FirstHit(C_t, u, P),  x_t(u) = HitPoint(...)          Eq. (9)
+    r_t(u) = d_t(u) - 2 (n_t(u)^T d_t(u)) n_t(u)                    Eq. (9a)
+    c_v = x_t(u_ref) + eps r_t(u_ref),  Q_v = LookAt(r_t(u_ref), h_t)   Eq. (9b)
+    cos theta_t(u) = |n_t(u)^T d_t(u)|                              Eq. (10)
+
+"First visible" hit. Eq. (9) intersects the camera ray with the patches only, so a glass patch behind an opaque
+object (a pedestrian in front of a shop window) would still be selected and a reflection blended over the object.
+`first_hit` therefore also takes the depth of the frozen Phase I direct pass: a hit is dropped when the direct pass
+is opaque there and its depth lies in front of the glass. This uses the reconstructed geometry only (no learned
+mask, nothing trained); `occlusion=None` gives the literal Eq. (9) (ablation `--ablate_occlusion`).
+
+Patches are dicts {'normal': (3,), 'offset': (), 'vertices': (V, 3)} of tensors after `validate_patches`.
+"""
+
+import json
+
 import torch
 import torch.nn.functional as F
 
-from utils.point_utils import camera_rays, depths_to_points
+from utils.point_utils import camera_rays
 
 
 def validate_patches(records, device='cuda'):
-    if not records: raise ValueError('No finite glass patches.')
-    patches=[]
-    for record in records:
-        n=torch.as_tensor(record['normal'],device=device,dtype=torch.float32)
-        d=torch.as_tensor(record['offset'],device=device,dtype=torch.float32)
-        vertices=torch.as_tensor(record['vertices'],device=device,dtype=torch.float32)
-        if n.shape!=(3,) or not torch.isfinite(n).all() or not torch.isfinite(d) or n.norm()<1e-8:
-            raise ValueError('Invalid plane normal.')
-        d=d/n.norm(); n=F.normalize(n,dim=0)
-        if vertices.ndim!=2 or vertices.shape[1]!=3 or len(vertices)<3 or not torch.isfinite(vertices).all():
-            raise ValueError('A patch needs at least three finite 3D vertices.')
-        tolerance=max(float(vertices.std()),1.)*1e-4
-        if (vertices@n+d).abs().max()>tolerance: raise ValueError('Patch vertices must lie on their plane.')
-        edges=vertices.roll(-1,0)-vertices
-        area=torch.cross(vertices-vertices[0],vertices.roll(-1,0)-vertices[0],dim=-1).sum(0).norm()
-        if area<1e-10: raise ValueError('Patch polygon has zero area.')
-        turns=(torch.cross(edges,edges.roll(-1,0),dim=-1)*n).sum(-1)
-        if not ((turns>=-1e-6).all() or (turns<=1e-6).all()):
-            raise ValueError('Patch vertices must form an ordered convex polygon.')
-        patches.append({'normal':n,'offset':d,'vertices':vertices})
+    """Unit normals, finite planar convex polygons. `records` come from JSON (lists) or a previous call."""
+    if not records:
+        raise ValueError('No glass patches.')
+    patches = []
+    for index, record in enumerate(records):
+        n = torch.as_tensor(record['normal'], dtype=torch.float32, device=device)
+        d = torch.as_tensor(record['offset'], dtype=torch.float32, device=device)
+        vertices = torch.as_tensor(record['vertices'], dtype=torch.float32, device=device)
+        if n.shape != (3,) or not torch.isfinite(n).all() or not torch.isfinite(d) or n.norm() < 1e-8:
+            raise ValueError(f'Patch {index}: invalid plane normal {record["normal"]}')
+        d, n = d / n.norm(), F.normalize(n, dim=0)
+        if vertices.ndim != 2 or vertices.shape[1] != 3 or len(vertices) < 3 or not torch.isfinite(vertices).all():
+            raise ValueError(f'Patch {index}: a patch needs at least three finite 3D vertices')
+        tolerance = max(float((vertices - vertices.mean(0)).norm(dim=-1).max()), 1.0) * 1e-4
+        if (vertices @ n + d).abs().max() > tolerance:
+            raise ValueError(f'Patch {index}: vertices do not lie on the plane n^T x + d = 0')
+        edges = vertices.roll(-1, 0) - vertices
+        area = torch.cross(vertices - vertices[0], vertices.roll(-1, 0) - vertices[0], dim=-1).sum(0).norm()
+        if area < 1e-10:
+            raise ValueError(f'Patch {index}: zero-area polygon')
+        turns = (torch.cross(edges, edges.roll(-1, 0), dim=-1) * n).sum(-1)
+        if not ((turns >= -1e-6).all() or (turns <= 1e-6).all()):
+            raise ValueError(f'Patch {index}: vertices must form an ordered convex polygon')
+        patches.append({'normal': n, 'offset': d, 'vertices': vertices})
     return patches
 
 
-def first_hit(view, patches, epsilon=1e-4):
-    origin,direction=camera_rays(view)
-    direction=F.normalize(direction,dim=-1)
-    shape=direction.shape[:-1]
-    nearest=torch.full(shape,float('inf'),device=direction.device)
-    selected=torch.full(shape,-1,device=direction.device,dtype=torch.int32)
-    normals=torch.zeros_like(direction)
-    for i,patch in enumerate(patches):
-        n,d,vertices=patch['normal'],patch['offset'],patch['vertices']
-        denom=direction@n
-        safe=torch.where(denom.abs()>1e-8,denom,torch.ones_like(denom))
-        distance=-(origin@n+d)/safe
-        point=origin+distance[...,None]*direction
-        signs=[]
-        for a,b in zip(vertices,vertices.roll(-1,0)):
-            signs.append((torch.cross((b-a).expand_as(point),point-a,dim=-1)*n).sum(-1))
-        signs=torch.stack(signs)
-        inside=(signs>=-1e-6).all(0)|(signs<=1e-6).all(0)
-        valid=inside & (denom.abs()>1e-8) & (distance>epsilon) & (distance<nearest)
-        nearest=torch.where(valid,distance,nearest)
-        selected=torch.where(valid,i,selected)
-        normals=torch.where(valid[...,None],n,normals)
-    visible=selected>=0
-    distance=torch.where(visible,nearest,torch.zeros_like(nearest))
-    hits=origin+distance[...,None]*direction
-    reflected=F.normalize(direction-2*(direction*normals).sum(-1,keepdim=True)*normals,dim=-1)
-    origins=hits+epsilon*reflected
-    cosine=(normals*direction).sum(-1).abs().clamp(0,1)
-    return {'patches':selected,'origins':origins,'directions':reflected,'cosine':cosine,
-            'hits':hits,'real_directions':direction,'normals':normals,'visible':visible}
+def patches_to_records(patches):
+    return [{'normal': p['normal'].tolist(), 'offset': float(p['offset']), 'vertices': p['vertices'].tolist()} for p in patches]
 
 
-def dynamic_virtual_camera(view, geometry, patch_index):
-    """Eq. 9b diagnostic/control pose; rendering always uses per-pixel rays."""
-    pixels=(geometry['patches']==patch_index).nonzero()
-    if pixels.numel()==0: return None
-    y,x=pixels[len(pixels)//2]
-    forward=geometry['directions'][y,x]
-    up=-view.world_view_transform.T.inverse()[:3,1]
-    if torch.abs(up@forward)>0.99:
-        axis=torch.argmin(forward.abs())
-        up=F.one_hot(axis,3).to(forward)
-    right=F.normalize(torch.cross(forward,up,dim=0),dim=0)
-    up=torch.cross(right,forward,dim=0)
-    return {'center':geometry['origins'][y,x], 'rotation':torch.stack([right,-up,forward],1), 'reference_pixel':(x,y)}
+def load_glass_geometry(path, device='cuda'):
+    """(patches, record) from a glass_geometry.json written by extract_glass.py, or a list/dict of patches."""
+    with open(path) as f:
+        record = json.load(f)
+    records = record['patches'] if isinstance(record, dict) else record
+    return validate_patches(records, device), record if isinstance(record, dict) else {'patches': records}
 
 
-@torch.no_grad()
-def extract_patches(cameras, interface, deformation, pipe, args, render_fn, extent):
-    """Training-only mask-guided RANSAC. Does not claim glass depth is identifiable."""
-    from scipy.spatial import ConvexHull, cKDTree
-    sample_points=[]
-    selected_views=cameras[::max(1,len(cameras)//12)]
-    per_view=max(200,args.plane_max_points//len(selected_views))
-    for cam in selected_views:
-        out=render_fn(cam,interface,deformation,pipe,surface=True)
-        valid=cam.gt_transparent_mask.to('cuda')[0] & cam.valid_mask.to('cuda')[0]
-        valid &= (out['surface_alpha'][0]>0.3) & (out['glass_map'][0]>0.1) & (out['surface_depth'][0]>0)
-        points=depths_to_points(cam,out['surface_depth'].permute(1,2,0))[valid]
-        points=points[torch.isfinite(points).all(-1)]
-        if len(points)>per_view: points=points[torch.randperm(len(points),device=points.device)[:per_view]]
-        if len(points): sample_points.append(points.cpu().numpy())
-    if not sample_points: raise RuntimeError('Phase I produced no glass-supported surface samples. Supply fixed geometry or improve Phase I.')
-    points=np.concatenate(sample_points)
-    if len(points)>args.plane_max_points:
-        points=points[np.random.default_rng(args.seed).choice(len(points),args.plane_max_points,replace=False)]
-    threshold=args.plane_threshold*extent
-    rng=np.random.default_rng(args.seed)
-    remaining=points.copy(); records=[]
-    for _ in range(args.max_patches):
-        if len(remaining)<args.plane_min_inliers: break
-        best=np.zeros(len(remaining),bool)
-        for batch in range(8):
-            triplets=remaining[rng.integers(len(remaining),size=(64,3))]
-            n=np.cross(triplets[:,1]-triplets[:,0],triplets[:,2]-triplets[:,0])
-            length=np.linalg.norm(n,axis=1)
-            n=n/np.maximum(length[:,None],1e-12)
-            d=-(n*triplets[:,0]).sum(-1)
-            support=np.abs(remaining@n.T+d)<threshold
-            support[:,length<1e-8]=False
-            index=support.sum(0).argmax()
-            if support[:,index].sum()>best.sum(): best=support[:,index]
-        if best.sum()<args.plane_min_inliers: break
-        centroid=remaining[best].mean(0)
-        _,_,basis=np.linalg.svd(remaining[best]-centroid,full_matrices=False)
-        n=basis[-1]; d=-n@centroid
-        best=np.abs(remaining@n+d)<threshold
-        inliers=remaining[best]
-        remaining=remaining[~best]
-        uv=(inliers-centroid)@basis[:2].T
-        # Split disconnected coplanar supports before computing convex boundaries.
-        tree=cKDTree(uv)
-        distances=tree.query(uv,k=2)[0][:,1]
-        radius=max(np.median(distances)*8,threshold*3)
-        pairs=tree.query_pairs(radius)
-        parent=np.arange(len(uv))
-        def find(i):
-            while parent[i]!=i: parent[i]=parent[parent[i]]; i=parent[i]
-            return i
-        for a,b in pairs: parent[find(a)]=find(b)
-        labels=np.array([find(i) for i in range(len(uv))])
-        for label in np.unique(labels):
-            group=labels==label
-            if group.sum()<args.plane_min_inliers: continue
-            component=uv[group]
-            try: hull=ConvexHull(component)
-            except Exception: continue
-            vertices=centroid+component[hull.vertices]@basis[:2]
-            records.append({'normal':n.tolist(),'offset':float(d),'vertices':vertices.tolist(),
-                'inliers':int(group.sum()),'rmse':float(np.sqrt(np.mean((inliers[group]@n+d)**2))),
-                'source':'phase_i_mask_guided_surface'})
-            if len(records)>=args.max_patches: break
-        if len(records)>=args.max_patches: break
-    if not records: raise RuntimeError('No supported finite glass plane found; Phase I checkpoint was saved. Supply geometry or improve Phase I.')
-    patches=validate_patches(records)
-    intersection=predicted=annotated=0
-    for cam in selected_views:
-        visible=first_hit(cam,patches,pipe.ray_epsilon)['visible']
-        valid=cam.valid_mask.to('cuda')[0]
-        target=cam.gt_transparent_mask.to('cuda')[0]
-        intersection+=int((visible&target&valid).sum())
-        predicted+=int((visible&valid).sum()); annotated+=int((target&valid).sum())
-    quality={'coverage':intersection/max(annotated,1),'precision':intersection/max(predicted,1),
-             'sample_points':len(points),'training_views':len(selected_views)}
-    print('Glass geometry quality:',quality)
-    return records,quality
+def reflect(directions, normals):
+    """Eq. (9a): specular reflection of unit directions about unit normals (both (..., 3))."""
+    return directions - 2 * (directions * normals).sum(-1, keepdim=True) * normals
+
+
+def mirror_points(points, normal, offset):
+    """Reflection of world points across the plane n^T x + d = 0."""
+    return points - 2 * (points @ normal + offset)[..., None] * normal
+
+
+def _inside_polygon(points, vertices, normal):
+    signs = torch.stack([(torch.cross((b - a).expand_as(points), points - a, dim=-1) * normal).sum(-1) for a, b in zip(vertices, vertices.roll(-1, 0))])
+    return (signs >= -1e-6).all(0) | (signs <= 1e-6).all(0)
+
+
+def first_hit(view, patches, epsilon=1e-4, occlusion=None):
+    """
+    Eq. (9)-(10) for every pixel of `view`.
+
+    occlusion: None (literal Eq. 9) or {'depth': (1, H, W), 'alpha': (1, H, W), 'tolerance': float, 'alpha_min': float}
+    from the frozen direct pass: a hit is occluded where alpha >= alpha_min and depth < hit depth * (1 - tolerance).
+
+    Returns (H, W) maps: patch (int32, -1 = no glass), visible (bool), distance along the unit ray, cosine
+    |n^T d|, and (H, W, 3) maps: hits x_t(u), normals n_t(u), real_directions d_t(u) (unit), reflected r_t(u) (unit).
+    Off the glass, normals and reflected directions are zero and the hit is the camera center.
+    """
+    origin, rays = camera_rays(view)  # rays have camera-space z = 1
+    lengths = rays.norm(dim=-1)
+    direction = rays / lengths[..., None]
+    shape = direction.shape[:-1]
+    nearest = torch.full(shape, float('inf'), device=direction.device)
+    selected = torch.full(shape, -1, device=direction.device, dtype=torch.int32)
+    normals = torch.zeros_like(direction)
+    for index, patch in enumerate(patches):
+        n, d = patch['normal'], patch['offset']
+        denominator = direction @ n
+        safe = torch.where(denominator.abs() > 1e-8, denominator, torch.ones_like(denominator))
+        distance = -(origin @ n + d) / safe
+        points = origin + distance[..., None] * direction
+        hit = (denominator.abs() > 1e-8) & (distance > epsilon) & (distance < nearest) & _inside_polygon(points, patch['vertices'], n)
+        nearest = torch.where(hit, distance, nearest)
+        selected = torch.where(hit, torch.full_like(selected, index), selected)
+        normals = torch.where(hit[..., None], n.expand_as(normals), normals)
+    visible = selected >= 0
+    occluded = torch.zeros_like(visible)
+    if occlusion is not None:
+        hit_depth = nearest / lengths  # camera-space z of the hit
+        depth, alpha = occlusion['depth'][0], occlusion['alpha'][0]
+        occluded = visible & (alpha >= occlusion['alpha_min']) & (depth < hit_depth * (1 - occlusion['tolerance']))
+        visible = visible & ~occluded
+    selected = torch.where(visible, selected, torch.full_like(selected, -1))
+    normals = torch.where(visible[..., None], normals, torch.zeros_like(normals))
+    distance = torch.where(visible, nearest, torch.zeros_like(nearest))
+    hits = origin + distance[..., None] * direction
+    reflected = F.normalize(reflect(direction, normals), dim=-1) * visible[..., None]
+    cosine = (normals * direction).sum(-1).abs().clamp(0, 1)
+    return {'patch': selected, 'visible': visible, 'occluded': occluded, 'distance': distance, 'cosine': cosine,
+            'hits': hits, 'normals': normals, 'real_directions': direction, 'reflected': reflected, 'camera_center': origin}
+
+
+def look_at(forward, up):
+    """
+    Camera-to-world rotation of a camera looking along `forward` with `up` roughly up (COLMAP axes: x right,
+    y down, z forward). A proper rotation (det +1), as Eq. (9b) needs for a pinhole rasterizer.
+    """
+    forward = F.normalize(forward, dim=0)
+    if torch.abs(up @ forward) > 0.99 * up.norm():  # up parallel to forward: any perpendicular will do
+        up = F.one_hot(torch.argmin(forward.abs()), 3).to(forward)
+    right = F.normalize(torch.cross(forward, up, dim=0), dim=0)
+    down = torch.cross(forward, right, dim=0)
+    return torch.stack([right, down, forward], 1)
+
+
+def dynamic_virtual_camera(view, geometry, patches, patch_index, epsilon=1e-4):
+    """
+    Eq. (9b): the single virtual camera V_dyn, posed for the region whose rays meet patch `patch_index`.
+
+    The reference pixel u_ref is the pixel of the region closest to the region's mean pixel position. Returns None
+    when the patch is not visible in `view`, else {'center': c_v, 'rotation': Q_v (camera-to-world),
+    'reference_pixel': (x, y), 'mirrored_center'}. `mirrored_center` is the real camera center reflected across the
+    patch plane: every reflected ray of the region passes through it (extended backwards), which is what makes the
+    exact reflected-ray render a central projection per patch (gaussian_renderer/reflection.py).
+    """
+    pixels = (geometry['patch'] == patch_index).nonzero()
+    if pixels.numel() == 0:
+        return None
+    mean = pixels.float().mean(0)
+    y, x = pixels[(pixels.float() - mean).square().sum(-1).argmin()]
+    forward = geometry['reflected'][y, x]
+    up = -view.world_view_transform[:3, :3][:, 1]  # world_view_transform[:3, :3] is camera-to-world; COLMAP y points down
+    patch = patches[patch_index]
+    return {'center': geometry['hits'][y, x] + epsilon * forward, 'rotation': look_at(forward, up), 'reference_pixel': (int(x), int(y)),
+            'mirrored_center': mirror_points(geometry['camera_center'], patch['normal'], patch['offset'])}
