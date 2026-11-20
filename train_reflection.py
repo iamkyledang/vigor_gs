@@ -218,22 +218,24 @@ def training(model_args, pipe, params, opt, resume=False, quiet=False):
     return field, deformation, optical, constant
 
 
-def parse(argv):
+def parse(argv, known=False):
+    """Parsed settings of this step; with `known`, arguments of other steps are left in args.unknown (train.py)."""
     parser = ArgumentParser(description='VIGOR-GS Phase II: reflection field with the interface and glass fixed')
     model, pipeline = ModelParams(parser, sentinel=True), PipelineParams(parser)
     params, optimization = ReflectionParams(parser), ReflectionOptimizationParams(parser)
     parser.add_argument('--resume', action='store_true', help='continue <model>/reflection/latest.pth')
     parser.add_argument('--quiet', action='store_true')
-    args = parser.parse_args(argv)
+    args, unknown = parser.parse_known_args(argv) if known else (parser.parse_args(argv), [])
     if not args.model_path:
         parser.error('-m is required')
     model_args = model.extract(args)
     model_args.model_path = os.path.abspath(model_args.model_path)
+    args.unknown = unknown
     return load_model_args(model_args), pipeline.extract(args), params.extract(args), optimization.extract(args), args
 
 
-def main(argv=None):
-    model_args, pipe, params, opt, args = parse(sys.argv[1:] if argv is None else argv)
+def main(argv=None, known=False):
+    model_args, pipe, params, opt, args = parse(sys.argv[1:] if argv is None else argv, known)
     training(model_args, pipe, params, opt, resume=args.resume, quiet=args.quiet)
     print('Phase II done:', os.path.join(model_args.model_path, PHASE))
 

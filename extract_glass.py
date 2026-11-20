@@ -77,19 +77,22 @@ def extract(model_args, pipe, glass):
     return record
 
 
-def parse(argv):
+def parse(argv, known=False):
+    """Parsed settings of this step; with `known`, arguments of other steps are left in args.unknown (train.py)."""
     parser = ArgumentParser(description='VIGOR-GS: fixed glass patches from known geometry or the Phase I field')
     model, pipeline, glass = ModelParams(parser, sentinel=True), PipelineParams(parser), GlassParams(parser)
-    args = parser.parse_args(argv)
+    args, unknown = parser.parse_known_args(argv) if known else (parser.parse_args(argv), [])
     if not args.model_path:
         parser.error('-m is required')
     model_args = model.extract(args)
     model_args.model_path = os.path.abspath(model_args.model_path)
-    return load_model_args(model_args), pipeline.extract(args), glass.extract(args)
+    glass_args = glass.extract(args)
+    glass_args.unknown = unknown
+    return load_model_args(model_args), pipeline.extract(args), glass_args
 
 
-def main(argv=None):
-    model_args, pipe, glass = parse(sys.argv[1:] if argv is None else argv)
+def main(argv=None, known=False):
+    model_args, pipe, glass = parse(sys.argv[1:] if argv is None else argv, known)
     if model_args.ignore_clean_images:
         raise SystemExit('This model is the no-separation ablation (--ignore_clean_images): it has no Phase II and needs no glass patches.')
     record = extract(model_args, pipe, glass)
