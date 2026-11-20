@@ -1,11 +1,10 @@
 # VIGOR-GS implementation specification
 
-This checkout implements `framework.tex` by replacing the inherited RT-Splatting mechanism. The implementation was initially kept in existing source files and subsequently split into the modules below with the user's approval. Reference code from `../vigor_gs_viet_huynh` informed Gaussian storage, optimizer surgery and canonical deformation; no runtime imports depend on that checkout.
+This checkout implements `docs/framework.tex` by replacing the inherited RT-Splatting mechanism. The implementation was initially kept in existing source files and subsequently split into the modules below with the user's approval. Reference code from `../vigor_gs_viet_huynh` informed Gaussian storage, optimizer surgery and canonical deformation; no runtime imports depend on that checkout.
 
 ## Decisions agreed with the user
 
 - Initially reuse existing implementation files. The user subsequently approved seven focused implementation modules and three regression-test files for maintainability.
-- `specification.md`, dated records under `log/`, runtime training/render outputs, and a local `.conda` environment are authorized.
 - Use **training** glass annotations to guide Phase I surface fitting. Extract finite 3D glass patches after Phase I and freeze them for Phase II. Test masks are used for reporting only.
 - The masks add an explicit supervised geometry prior beyond the original clean-RGB-only Phase I equation. They do not become learned plane assignments or inference blending masks.
 
@@ -105,11 +104,10 @@ Use `.conda/bin/python metrics.py -m output/<run> --performance_only` to add or 
 
 The project environment is `VIGOR_GS/.conda`, based on the existing Python 3.10 / PyTorch 2.0.1 CUDA 11.8 RT-Splatting environment. The project's own rebuilt CUDA extension is loaded from its existing submodule path, so installing it does not replace RT-Splatting's installed renderer. No tiny-cuda-nn or new 3D rasterizer submodule is needed.
 
-`log/` holds dated implementation notes, unified patches and the last source snapshot. Training automatically records any source change since the previous snapshot. For continuous logging while editing, run `bash eval.sh --watch` in another terminal. Use `bash eval.sh --snapshot` for an immediate snapshot. The watcher is optional and is not installed as a system service.
 
 ## Module responsibilities and reading order
 
-Read the equations in `framework.tex`, then this document, followed by:
+Read the equations in `docs/framework.tex`, then this document, followed by:
 
 1. `arguments/__init__.py`: model, rendering and optimization settings; defaults still use resolution 1.
 2. `train.py`: sequential phases, losses, freezing, direct-image cache and optimization schedule. Both phases remain together so their lifecycle is visible in one place.

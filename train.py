@@ -21,7 +21,6 @@ from utils.glass_geometry import extract_patches, validate_patches
 from utils.checkpoint_utils import checkpoint, load_field, restore_rng_state
 from utils.color_utils import srgb2linear
 from utils.loss_utils import ssim
-from utils.system_utils import record_implementation_change
 
 
 def seed_everything(seed):
@@ -228,7 +227,7 @@ def main():
             if saved[name]!=getattr(args,name):
                 raise ValueError(f'{name} differs from saved model configuration ({saved[name]}). Pass the same configuration when resuming.')
     config.write_text(json.dumps(vars(args),indent=2))
-    record_implementation_change();seed_everything(args.seed)
+    seed_everything(args.seed)
     scene=Scene(args)
     if args.init_points>args.max_interface_points or args.reflection_init_points>args.max_reflection_points:
         raise ValueError('Initial point counts exceed their configured point caps.')

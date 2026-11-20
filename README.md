@@ -1,6 +1,6 @@
 # VIGOR-GS
 
-Implementation of [framework.tex](framework.tex), replacing the inherited RT-Splatting mechanism. Read [specification.md](specification.md) for the equations, approved geometry-extraction prior, renderer approximations, module reading order and validation status.
+Implementation of [docs/framework.pdf](docs/framework.pdf) (source: [docs/framework.tex](docs/framework.tex)), replacing the inherited RT-Splatting mechanism. Read [specification.md](specification.md) for the equations, approved geometry-extraction prior, renderer approximations, module reading order and validation status.
 
 The local environment is `.conda`. Commands below run from this folder and use its Python directly; activation is optional:
 
@@ -53,9 +53,6 @@ Resolution defaults to **1**. The default configuration uses 30,000 iterations p
 # Render Phase I without a reflection checkpoint.
 .conda/bin/python render.py -m output/vsgd0758_quick --direct_only --skip_train
 
-# Record implementation changes immediately, or continuously while editing.
-bash eval.sh --snapshot
-bash eval.sh --watch
 ```
 
 The first resume command continues Phase I to its configured iteration count and then starts Phase II. The second resumes Phase II directly. Increase a phase length with `--iterations` or `--reflection_iterations`. Choose a fresh model directory for a separate experiment; existing checkpoints are protected from an accidental new training run.
