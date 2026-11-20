@@ -1,21 +1,28 @@
-"""Scene loading without implicit split changes or model-output side effects."""
+"""A scene: its training and test cameras, SfM points and normalization."""
+
+from scene.cameras import Camera
 from scene.dataset_readers import readVigorSceneInfo
-from scene.gaussian_model import GaussianModel
-from utils.camera_utils import cameraList_from_camInfos
 
 
 class Scene:
-    def __init__(self, args, gaussians=None, load_iteration=None, shuffle=False):
-        self.model_path = args.model_path
-        self.gaussians = gaussians
-        info = readVigorSceneInfo(args)
-        self.cameras_extent = info.nerf_normalization['radius']
-        self.center = info.nerf_normalization['center']
-        self.point_cloud = info.point_cloud
-        self.train_cameras = cameraList_from_camInfos(info.train_cameras, 1.0, args)
-        self.test_cameras = cameraList_from_camInfos(info.test_cameras, 1.0, args)
-        if gaussians is not None:
-            gaussians.create_from_pcd(info.point_cloud, self.cameras_extent)
+    """
+    Loads every camera of `args.source_path` at `args.resolution`.
 
-    def getTrainCameras(self, scale=1.0): return self.train_cameras
-    def getTestCameras(self, scale=1.0): return self.test_cameras
+    `center` and `extent` (the radius that holds the training cameras) set the spatial learning rates, the
+    deformation input normalization and the size of the reflection-field initialization.
+    """
+
+    def __init__(self, args, load_clean=True):
+        info = readVigorSceneInfo(args.source_path, args.clean_images, ignore_clean_images=args.ignore_clean_images or not load_clean,
+                                  init_points=args.init_points, seed=args.seed)
+        self.center = info.center
+        self.extent = info.extent
+        self.point_cloud = info.point_cloud
+        self.train_cameras = [Camera(c, args.resolution, args.data_device) for c in info.train_cameras]
+        self.test_cameras = [Camera(c, args.resolution, args.data_device) for c in info.test_cameras]
+
+    def getTrainCameras(self):
+        return self.train_cameras
+
+    def getTestCameras(self):
+        return self.test_cameras

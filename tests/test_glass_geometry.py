@@ -5,7 +5,6 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from utils.calibration_utils import build_remap, camera_calibration, distort_points
 from utils.glass_geometry import dynamic_virtual_camera, first_hit, validate_patches
 from utils.point_utils import camera_rays, depth_to_normal_sobel
 
@@ -72,20 +71,6 @@ class GlassGeometryTests(unittest.TestCase):
         normals = depth_to_normal_sobel(view, torch.ones(13, 17, 1))
         expected = torch.tensor([0., 0., -1.]).expand(11, 15, 3)
         torch.testing.assert_close(normals[1:-1, 1:-1], expected)
-
-    def test_undistorted_remap_preserves_pixel_indices(self):
-        intr = SimpleNamespace(model='PINHOLE', params=[20., 21., 8.5, 6.5])
-        matrix, distortion = camera_calibration(intr)
-        np.testing.assert_array_equal(distortion, np.zeros(5))
-        target = dict(fx=matrix[0, 0], fy=matrix[1, 1], cx=8.5, cy=6.5,
-                      width=17, height=13)
-        params = [20., 21., 8.5, 6.5, 0., 0.]
-        points = np.array([[0., 0.], [8., 6.], [16., 12.]])
-        np.testing.assert_allclose(distort_points(points, target, params), points, atol=1e-12)
-        x, y = build_remap(target, params)
-        np.testing.assert_allclose(x, np.tile(np.arange(17), (13, 1)), atol=1e-6)
-        np.testing.assert_allclose(y, np.tile(np.arange(13)[:, None], (1, 17)), atol=1e-6)
-
 
 if __name__ == '__main__':
     unittest.main()

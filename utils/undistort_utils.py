@@ -1,28 +1,3 @@
-"""Source-camera recovery and rectification on the COLMAP pixel grid."""
-from pathlib import Path
-
-import cv2
-import numpy as np
-from scipy.optimize import least_squares
-
-
-def camera_calibration(cam):
-    p = np.asarray(cam.params, dtype=np.float64)
-    if cam.model in ('SIMPLE_PINHOLE', 'SIMPLE_RADIAL', 'RADIAL'):
-        fx, fy, cx, cy = p[0], p[0], p[1], p[2]
-        dist = np.zeros(5)
-        if cam.model == 'SIMPLE_RADIAL': dist[0] = p[3]
-        if cam.model == 'RADIAL': dist[:2] = p[3:5]
-    elif cam.model in ('PINHOLE', 'OPENCV', 'FULL_OPENCV'):
-        fx, fy, cx, cy = p[:4]
-        dist = np.zeros(8 if cam.model == 'FULL_OPENCV' else 5)
-        if cam.model != 'PINHOLE': dist[:len(p)-4] = p[4:]
-    else:
-        raise ValueError(f'Unsupported camera {cam.model}; rectify it to PINHOLE first.')
-    return np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1.]], dtype=np.float64), dist
-
-
-# Source-camera recovery adapted from Viet Huynh's undistort_utils.py.
 """
 Warp from the distorted source images of a scene to its undistorted COLMAP images.
 
@@ -42,6 +17,10 @@ y = (v' - cy') / fy', r = sqrt(x^2 + y^2), and lands on the source pixel u = fx 
 VSGD phone videos are mildly distorted (radial fits to ~0.15 px); the WayveScenes101 cameras are wide-angle
 (~120 degrees) and need the fisheye model.
 """
+
+import cv2
+import numpy as np
+from scipy.optimize import least_squares
 
 MODELS = {
     'radial': ('fx', 'fy', 'cx', 'cy', 'k1', 'k2'),
@@ -147,39 +126,19 @@ def match_points(source_gray, colmap_gray, ratio=0.75, max_features=8000):
     return pc, ps
 
 
+def local_shifts(a, b, grid=3, half=96):
+    """Phase-correlation shifts (pixels) between two same-size gray images on a grid x grid set of patches."""
+    height, width = a.shape
+    shifts = []
+    for fy in np.linspace(0.1, 0.9, grid):
+        for fx in np.linspace(0.08, 0.92, grid):
+            cy, cx = int(fy * height), int(fx * width)
+            y0, y1, x0, x1 = max(cy - half, 0), min(cy + half, height), max(cx - half, 0), min(cx + half, width)
+            (dx, dy), _ = cv2.phaseCorrelate(a[y0:y1, x0:x1].astype(np.float32), b[y0:y1, x0:x1].astype(np.float32))
+            shifts.append((dx, dy))
+    return np.array(shifts)
 
-def fit_source_calibration(root,colmap,intr,extrinsics,records,source_size):
-    candidates=[e for e in extrinsics.values() if e.camera_id==intr.id and records[Path(e.name).stem]['split']=='train']
-    candidates.sort(key=lambda e:e.name)
-    indices=np.unique(np.linspace(0,len(candidates)-1,min(8,len(candidates))).round().astype(int))
-    if len(indices)<2: raise ValueError('Need at least two training images to recover missing source calibration.')
-    K,_=camera_calibration(intr)
-    target={'fx':K[0,0],'fy':K[1,1],'cx':K[0,2],'cy':K[1,2]}
-    pairs=[]
-    for index in indices:
-        ext=candidates[index];record=records[Path(ext.name).stem]
-        source=cv2.imread(str(root/record['source_image']),cv2.IMREAD_GRAYSCALE)
-        image=cv2.imread(str(colmap/'images'/ext.name),cv2.IMREAD_GRAYSCALE)
-        if source is None: raise FileNotFoundError(f'Missing original source JPG for calibration: {record["source_image"]}')
-        pairs.append(match_points(source,image,max_features=4000))
-    # Hold out the last selected TRAINING view to check the recovered warp.
-    pc=np.concatenate([a for a,b in pairs[:-1]]);ps=np.concatenate([b for a,b in pairs[:-1]])
-    fits=[]
-    for model in ('radial','fisheye'):
-        try:
-            params,residual=fit_distortion(pc,ps,target,source_size,model)
-            check=np.linalg.norm(distort_points(pairs[-1][0],target,params,model)-pairs[-1][1],axis=1)
-            inliers=check<3
-            median=float(np.median(check[inliers])) if inliers.any() else float('inf')
-            fits.append((median,model,params,residual,check))
-        except ValueError: continue
-    if not fits: raise ValueError('Cannot recover source-to-COLMAP calibration from original JPG matches.')
-    fits.sort(key=lambda item:item[0])
-    median,model,params,residual,check=fits[0]
-    if median>1 or (check<3).sum()<20:
-        raise ValueError(f'Source calibration failed held-out training-view validation: median={median}, inliers={(check<3).sum()}')
-    record={'model':model,'params':params.tolist(),'source_size':list(source_size),
-        'heldout_median_px':median,'heldout_inliers':int((check<3).sum()),'training_frames':len(indices),
-        'target_size':[intr.width,intr.height]}
-    print('Recovered source calibration:',record,flush=True)
-    return record
+
+def psnr(a, b):
+    mse = np.mean((a.astype(np.float64) - b.astype(np.float64)) ** 2)
+    return float('inf') if mse == 0 else float(10 * np.log10(255.0**2 / mse))
