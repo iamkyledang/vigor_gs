@@ -1,0 +1,26 @@
+\chapter{Introduction}
+\section{Motivation}
+
+Glass is common in everyday scenes, from shop windows to indoor partitions, yet it makes 3D reconstruction difficult. A camera looking through a pane of glass records both the scene behind it and a reflection of the surroundings on the camera's side. These two contributions overlap in the same image, even though they originate from different objects and follow different geometric relationships.
+
+This overlap creates an ambiguity for Gaussian-based scene reconstruction. The observed color alone does not reveal how much light comes from the transmitted scene and how much comes from the reflection. A representation optimized to reproduce the combined image can consequently struggle to assign appearance to the appropriate scene component. Changes in viewpoint make this distinction more important: the reflected and transmitted objects do not necessarily shift in the same way, and their relative visibility can vary. A useful reconstruction must account for these differences while maintaining a consistent representation of the scene.
+
+The problem becomes more demanding when objects move. For example, an object behind a window may move independently of a person reflected in its surface. Their appearances can overlap briefly, separate, and overlap again as time progresses or the camera moves. The reconstruction must explain these changes without confusing motion in one component with motion in the other. Treating the appearance at each instant in isolation would also lose the temporal relationships needed to describe the underlying scene coherently.
+
+These observations motivate this project: extending reflection--transmission decomposition to dynamic scenes within a Gaussian Splatting framework. By representing the two components separately and relating them through the glass interface, the project aims to recover their individual appearance and motion while reproducing the images in which they are observed together.
+
+\section{Goal}
+
+The goal of this project is to develop a dynamic 3D Gaussian Splatting framework that reconstructs reflected and transmitted scene content as separate components. The framework should describe the geometry and appearance associated with each component and combine their rendered contributions to reproduce observations of a scene.
+
+A central objective is to handle independent motion in the two components. Objects visible through the glass and objects seen in reflection may follow different trajectories and change appearance at different times. Their representations should remain consistent across the available viewpoints and timestamps, allowing changes in the observed images to be associated with the appropriate component. The framework should also estimate the relative contributions of reflection and transmission so that the combined rendering remains consistent with the observations as the viewing direction changes.
+
+The intended outcome is a reconstruction that supports both separate inspection of the reflected and transmitted content and rendering of their combined appearance. Its performance will be assessed through reconstructed views and the consistency of the separated components across viewpoints and time.
+
+\section{Scope}
+
+The project focuses on dynamic 3D scenes containing planar glass, with reflected and transmitted content visible within the same observations. The scene may include stationary objects as well as objects moving independently in the reflected and transmitted components. The study considers observations across camera viewpoints and timestamps, with attention to the image regions in which these components overlap. Reconstruction is concerned with the scene and motion represented by the available data; predicting events beyond the observed time interval is outside the scope of the project.
+
+The work covers data preparation, implementation of the reconstruction pipeline, and evaluation of the resulting Gaussian representations. It examines how the reflected and transmitted components are represented, how their appearance changes over time, and how they are combined through the glass interface. Quantitative image comparisons and qualitative inspection will be used to assess the reconstructed views. Component-level comparisons will be considered where suitable reference data are available. Ablation experiments will examine the contributions of the main design choices, while the discussion will identify conditions under which separation remains difficult.
+
+The study adopts a planar-glass setting to concentrate on the interaction between reflection, transmission, and independent scene motion. It does not attempt to reconstruct thick or curved glass, liquid surfaces, or general transparent materials with complex geometry. Refractive distortion and multiple interreflections are also excluded from the intended model. The conclusions will therefore be limited to the selected planar-glass scenes and the acquisition conditions examined in the experiments.

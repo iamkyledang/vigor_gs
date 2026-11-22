@@ -1,162 +1,162 @@
-# VIGOR-GS: chi tiết triển khai (nhánh `f_refactor`)
+# VIGOR-GS: implementation details (`f_refactor` branch)
 
-Tài liệu này mô tả code hiện tại theo từng bước của framework (`docs/framework.pdf`, nguồn LaTeX `docs/framework.tex`). Mỗi mục nêu: phương trình được triển khai ở đâu, quy ước dữ liệu, và những chỗ code phải chọn một cách hiểu hoặc thêm vào so với PDF. Danh sách gom các chỗ đó nằm ở mục 12. Các ablation có tài liệu riêng ở `docs/ablations.md`. Những gì thay đổi so với nhánh `quan_dang` nằm ở `docs/changes_from_quan_dang.md`.
+This document describes the current code stage by stage, following the framework (`docs/framework.pdf`, LaTeX source `docs/framework.tex`). Each section identifies where equations are implemented, the data conventions, and where the code chooses an interpretation or adds something beyond the PDF. These choices are collected in Section 12. Ablations are documented separately in `docs/ablations.md`. Changes relative to the `quan_dang` branch are listed in `docs/changes_from_quan_dang.md`.
 
-## 0. Thứ tự đọc code
+## 0. Code reading order
 
-| Bước | File | Nội dung |
+| Stage | File | Contents |
 |---|---|---|
-| Dữ liệu | `scene/dataset_readers.py`, `scene/cameras.py`, `undistort_sources.py` | Layout đã căn chỉnh, camera, linear RGB, vùng hợp lệ |
-| Trường Gaussian | `scene/gaussian_model.py`, `scene/deformation.py` | `G_I^0`, `G_R^0` (Sec. 1), `D_I`, `D_R` (Eq. 1) |
+| Data | `scene/dataset_readers.py`, `scene/cameras.py`, `undistort_sources.py` | Aligned layout, cameras, linear RGB, valid region |
+| Gaussian fields | `scene/gaussian_model.py`, `scene/deformation.py` | `G_I^0`, `G_R^0` (Sec. 1), `D_I`, `D_R` (Eq. 1) |
 | Phase I | `gaussian_renderer/interface.py`, `utils/losses.py`, `train_interface.py` | Eq. 2–4, 3a |
-| Mặt kính | `utils/glass_geometry.py`, `utils/patch_extraction.py`, `extract_glass.py` | `P`, Eq. 9, 9a, 9b, 10 |
+| Glass surfaces | `utils/glass_geometry.py`, `utils/patch_extraction.py`, `extract_glass.py` | `P`, Eq. 9, 9a, 9b, 10 |
 | Phase II | `gaussian_renderer/reflection.py`, `gaussian_renderer/composition.py`, `train_reflection.py` | Eq. 5–8, 11 |
-| Suy luận, đánh giá | `render.py`, `metrics.py` | Eq. 12–13 |
-| Toàn chuỗi | `train.py`, `run_ablations.py` | Chạy các bước theo thứ tự, bộ ablation |
-| Dùng chung | `arguments/__init__.py`, `utils/model_io.py`, `utils/checkpoint_utils.py`, `utils/run_utils.py` | Tham số, nạp model, checkpoint, log |
-| CUDA | `submodules/diff-surfel-anych` | Rasterizer 2DGS và renderer tia phản xạ `render_reflected_rays` |
+| Inference, evaluation | `render.py`, `metrics.py` | Eq. 12–13 |
+| Full pipeline | `train.py`, `run_ablations.py` | Sequential stages, ablation suite |
+| Shared | `arguments/__init__.py`, `utils/model_io.py`, `utils/checkpoint_utils.py`, `utils/run_utils.py` | Parameters, model loading, checkpoints, logging |
+| CUDA | `submodules/diff-surfel-anych` | 2DGS rasterizer and reflected-ray renderer `render_reflected_rays` |
 
-## 1. Đối chiếu phương trình và code
+## 1. Mapping equations to code
 
-| PDF | Ý nghĩa | Code |
+| PDF | Meaning | Code |
 |---|---|---|
-| Sec. 1, `G_I^0`, `G_R^0` | Đĩa 2D `(μ, q, s⁽²⁾, p, o, a)`, ellipsoid 3D `(μ, q, s⁽³⁾, o, a)` | `InterfaceField`, `ReflectionField` trong `scene/gaussian_model.py` |
-| Eq. 1 | `G(t) = D_φ(G^0, t)`, p và o không phụ thuộc t | `Deformation.forward` (`scene/deformation.py`) |
-| Sec. 1, `P = {(n_k, d_k, S_k)}` | Patch kính cố định, hữu hạn | `validate_patches`, `glass_geometry.json` |
-| Eq. 2 | `B_t = R_2D(G_I(t), C_t)` với opacity `p·o` | `render_interface` (direct pass) |
+| Sec. 1, `G_I^0`, `G_R^0` | 2D disks `(μ, q, s⁽²⁾, p, o, a)`, 3D ellipsoids `(μ, q, s⁽³⁾, o, a)` | `InterfaceField`, `ReflectionField` in `scene/gaussian_model.py` |
+| Eq. 1 | `G(t) = D_φ(G^0, t)`, p and o independent of t | `Deformation.forward` (`scene/deformation.py`) |
+| Sec. 1, `P = {(n_k, d_k, S_k)}` | Fixed, finite glass patches | `validate_patches`, `glass_geometry.json` |
+| Eq. 2 | `B_t = R_2D(G_I(t), C_t)` with opacity `p·o` | `render_interface` (direct pass) |
 | Eq. 3 | `L_I = (1/|Ω|) Σ ‖B − I^clean‖₁ + λ_s L_surf` | `pixel_l1`, `interface_losses` |
 | Eq. 3a | `L_surf = (1/|Ω_s|) Σ ‖N − N^depth‖₁` | `surface_loss`, `out['surface_valid']` |
-| Eq. 4 | Tối ưu `{G_I^0, φ_I}` | `train_interface.training` |
-| Eq. 5 | Camera ảo `V_dyn` và renderer `R_3D^refl` | `dynamic_virtual_camera`, `ray_bundle`, `render_reflection` |
+| Eq. 4 | Optimize `{G_I^0, φ_I}` | `train_interface.training` |
+| Eq. 5 | Virtual camera `V_dyn` and renderer `R_3D^refl` | `dynamic_virtual_camera`, `ray_bundle`, `render_reflection` |
 | Eq. 6, 13 | `Î = (1 − α) B + α R` (linear RGB) | `render_composite` |
 | Eq. 7 | `L_R = (1/|Ω|) Σ ‖Î − I‖₁ + λ_m L_motion + λ_o L_opt` | `reflection_losses` |
-| Eq. 7a–7b | So độ thay đổi dự đoán và quan sát giữa hai frame liền kề | `motion_loss`, `previous_frames` |
+| Eq. 7a–7b | Compare predicted and observed changes between adjacent frames | `motion_loss`, `previous_frames` |
 | Eq. 7c | `L_opt = (1/|Ω|) Σ h_ψ²` | `optical_loss` |
-| Eq. 8 | Tối ưu `{G_R^0, φ_R}` và ψ, Θ_I cố định | `train_reflection.training` |
-| Eq. 9 | `Π_t(u) = FirstHit(...)`, `x_t(u)` | `first_hit` (có kiểm tra che khuất, mục 6.3) |
+| Eq. 8 | Optimize `{G_R^0, φ_R}` and ψ, with Θ_I fixed | `train_reflection.training` |
+| Eq. 9 | `Π_t(u) = FirstHit(...)`, `x_t(u)` | `first_hit` (with occlusion checks, Section 6.3) |
 | Eq. 9a | `r = d − 2(nᵀd) n` | `reflect`, `first_hit()['reflected']` |
 | Eq. 9b | `c_v = x(u_ref) + ε r(u_ref)`, `Q_v = LookAt(r, h)` | `dynamic_virtual_camera`, `look_at` |
 | Eq. 10 | `cos θ = |nᵀd|`, `F0`, Schlick | `first_hit()['cosine']`, `schlick` |
-| Eq. 11 | `α = clip(F + h_ψ)` trên kính, 0 ngoài kính | `reflection_weight` |
-| Eq. 12 | Suy luận với tham số cố định | `render.render_sets` |
+| Eq. 11 | `α = clip(F + h_ψ)` on glass, 0 elsewhere | `reflection_weight` |
+| Eq. 12 | Inference with fixed parameters | `render.render_sets` |
 
-## 2. Dữ liệu
+## 2. Data
 
-### 2.1. Layout của một scene
+### 2.1. Scene layout
 
 ```
-<scene>/colmap/images/<name>          ảnh gốc I_t, đã undistort về camera PINHOLE của COLMAP
-<scene>/colmap/sparse/0/              model COLMAP (bin hoặc txt): camera, pose, điểm SfM
-<scene>/colmap/frames.json            mỗi frame: time (chuẩn hoá về [0, 1]), split, source_clip (sequence)
-<scene>/colmap/split.json             tuỳ chọn, dùng khi frame không có split
-<scene>/colmap/masks/<stem>.png       mask kính M_t, đã căn với colmap/images
-<scene>/colmap/<clean_images>/        ảnh clean I_t^clean đã căn: <split>/images/<stem>.* hoặc <stem>.*
-<scene>/colmap/source_warp.json       tuỳ chọn: mô hình méo của ảnh nguồn (do undistort_sources.py ghi)
+<scene>/colmap/images/<name>          original images I_t, undistorted to COLMAP's PINHOLE camera
+<scene>/colmap/sparse/0/              COLMAP model (bin or txt): cameras, poses, SfM points
+<scene>/colmap/frames.json            per frame: time (normalized to [0, 1]), split, source_clip (sequence)
+<scene>/colmap/split.json             optional, used when a frame has no split
+<scene>/colmap/masks/<stem>.png       glass mask M_t, aligned with colmap/images
+<scene>/colmap/<clean_images>/        aligned clean images I_t^clean: <split>/images/<stem>.* or <stem>.*
+<scene>/colmap/source_warp.json       optional: source-image distortion model (written by undistort_sources.py)
 ```
 
-Mask và ảnh clean được tạo trên ảnh nguồn còn méo, nên phải được warp sang lưới COLMAP **một lần cho mỗi scene** bằng `undistort_sources.py` (lấy từ `viet_huynh`). Reader không warp gì cả, chỉ resize theo `-r`. Cả VSGD 0758, WayveScene101 scene_001 và 3D-FRONT-T scene_1 trong `data/` đều đã ở layout này.
+Masks and clean images are created on the distorted source images, so they must be warped to the COLMAP grid **once per scene** using `undistort_sources.py` (taken from `viet_huynh`). The reader performs no warping; it only resizes according to `-r`. VSGD 0758, WayveScene101 scene_001, and 3D-FRONT-T scene_1 in `data/` all already use this layout.
 
-- Frame train thiếu ảnh clean là lỗi, trừ khi bật `--ignore_clean_images` (ablation no-separation). Frame test thiếu ảnh clean thì được phép: nó chỉ được chấm với ảnh gốc.
-- Ảnh trong model COLMAP mà không có trong `frames.json` (ví dụ các camera khác của một rig) bị bỏ qua và in ra số lượng.
-- Chỉ nhận camera PINHOLE / SIMPLE_PINHOLE. Camera méo bị từ chối kèm hướng dẫn chạy `undistort_sources.py`.
-- `center`, `extent` tính như `getNerfppNorm` của 3DGS: tâm là trung bình các tâm camera train, `extent` bằng 1.1 lần khoảng cách lớn nhất.
+- A training frame without a clean image is an error unless `--ignore_clean_images` is enabled (the no-separation ablation). Test frames may lack clean images: they are evaluated only against the original images.
+- Images in the COLMAP model that are absent from `frames.json` (e.g., other cameras in a rig) are skipped, and their count is printed.
+- Only PINHOLE / SIMPLE_PINHOLE cameras are accepted. Distorted cameras are rejected with instructions to run `undistort_sources.py`.
+- `center` and `extent` follow 3DGS's `getNerfppNorm`: the center is the mean of the training camera centers, and `extent` is 1.1 times the maximum distance from that center.
 
-### 2.2. Vùng hợp lệ Ω
+### 2.2. Valid region Ω
 
-Undistort một ảnh góc rộng để lại những pixel không có pixel nguồn nào ánh xạ tới (viền đen). Khi có `source_warp.json`, reader dựng lại map của `cv2.remap` (`utils/undistort_utils.build_remap`). Pixel có toạ độ nguồn nằm ngoài ảnh nguồn được đánh dấu không hợp lệ. Cả hai định dạng của file này đều đọc được: bản cũ có `model` ở cấp ngoài cùng và một tiêu cự `f`, bản mới có `model` cho từng camera kèm `fx`, `fy`. Khi giảm độ phân giải, một pixel chỉ hợp lệ nếu toàn bộ diện tích của nó hợp lệ. Ω của mọi loss và metric là tập pixel hợp lệ này. Với 3 scene hiện có, Ω là toàn ảnh.
+Undistorting a wide-angle image leaves pixels with no corresponding source pixel (black borders). When `source_warp.json` is present, the reader reconstructs the `cv2.remap` map (`utils/undistort_utils.build_remap`). Pixels whose source coordinates fall outside the source image are marked invalid. Both file formats are supported: the old format with a top-level `model` and a single focal length `f`, and the new format with a per-camera `model` and `fx`, `fy`. When downsampling, a pixel is valid only if its entire area is valid. Ω in every loss and metric is this set of valid pixels. For the 3 existing scenes, Ω covers the whole image.
 
-### 2.3. Camera và màu
+### 2.3. Cameras and color
 
-`scene/cameras.py` giải mã pixel một lần, đúng độ phân giải train. Ảnh lưu dạng `uint8`, mask dạng `bool`, trên `data_device` (mặc định là RAM). Các property trả tensor CUDA:
+`scene/cameras.py` decodes pixels once, at the training resolution. Images are stored as `uint8` and masks as `bool` on `data_device` (RAM by default). The following properties return CUDA tensors:
 
-- `original_linear`, `clean_linear`: ảnh ở **linear RGB**, vì mọi phép khớp và blend của framework đều ở linear RGB (Eq. 3, 6). Giải mã sRGB theo chuẩn trong `utils/color_utils.srgb2linear`.
-- `original_srgb`: ảnh để lưu GT và tính metric.
+- `original_linear`, `clean_linear`: images in **linear RGB**, since all fitting and blending in the framework use linear RGB (Eq. 3, 6). Standard sRGB decoding is implemented in `utils/color_utils.srgb2linear`.
+- `original_srgb`: images for saving GT and computing metrics.
 - `glass_mask` (M_t), `valid_mask` (Ω).
 
-Intrinsics được scale theo `-r`, principal point theo quy ước COLMAP (tâm pixel tại +0.5). Ma trận chiếu có principal point lệch tâm: `P[0,2] = 2cx/W − 1`. Test `test_camera_scales_intrinsics_and_decodes_linear_rgb` kiểm tra rằng rasterizer và tia trong `utils/point_utils.camera_rays` dùng cùng một quy ước tâm pixel.
+Intrinsics are scaled according to `-r`, and the principal point follows COLMAP's convention (pixel centers at +0.5). The projection matrix supports an off-center principal point: `P[0,2] = 2cx/W − 1`. The test `test_camera_scales_intrinsics_and_decodes_linear_rgb` verifies that the rasterizer and the rays in `utils/point_utils.camera_rays` use the same pixel-center convention.
 
-## 3. Hai trường Gaussian
+## 3. The two Gaussian fields
 
-`GaussianField` (`scene/gaussian_model.py`) chứa phần không phụ thuộc loại primitive: lưu tham số, phẫu thuật optimizer khi clone/split/prune (moment Adam của điểm cũ được giữ, điểm mới bắt đầu từ 0), lịch densify của 3DGS, `save_ply`, `capture`/`restore`. Tham số theo từng Gaussian được liệt kê một lần trong `PARAMS`.
+`GaussianField` (`scene/gaussian_model.py`) contains the parts independent of primitive type: parameter storage, optimizer state adjustments during clone/split/prune (Adam moments are retained for existing points; new points start at 0), the 3DGS densification schedule, `save_ply`, and `capture`/`restore`. Per-Gaussian parameters are listed once in `PARAMS`.
 
 | | `InterfaceField` (G_I) | `ReflectionField` (G_R) |
 |---|---|---|
-| Primitive | Đĩa 2D (`SCALE_DIM = 2`) | Ellipsoid 3D (`SCALE_DIM = 3`) |
-| Tham số | xyz, SH, opacity o, scaling, rotation, **occupancy p** | xyz, SH, opacity o, scaling, rotation |
-| Opacity khi render | `p · o` (direct pass) | `o` |
-| Khởi tạo | Điểm SfM, màu đổi sang linear; p = 0.1, o = 0.5, quaternion ngẫu nhiên, scale = 0.1 × khoảng cách láng giềng | Các điểm dọc theo tia phản xạ (mục 7.6) |
-| "Presence" để prune/reset | p (o nếu không factorize) | o |
-| Giới hạn điểm | `--max_interface_points` 500k | `--max_reflection_points` 250k |
+| Primitive | 2D disk (`SCALE_DIM = 2`) | 3D ellipsoid (`SCALE_DIM = 3`) |
+| Parameters | xyz, SH, opacity o, scaling, rotation, **occupancy p** | xyz, SH, opacity o, scaling, rotation |
+| Rendering opacity | `p · o` (direct pass) | `o` |
+| Initialization | SfM points, colors converted to linear; p = 0.1, o = 0.5, random quaternions, scale = 0.1 × neighbor distance | Points along reflected rays (Section 7.6) |
+| "Presence" for pruning/reset | p (o without factorization) | o |
+| Point limit | `--max_interface_points` 500k | `--max_reflection_points` 250k |
 
-Occupancy, opacity và màu là tham số canonical, nên không phụ thuộc thời gian (Sec. 1). `factorized=False` (`--ablate_factorization`) bỏ hẳn tham số p (p ≡ 1).
+Occupancy, opacity, and color are canonical parameters, so they are independent of time (Sec. 1). `factorized=False` (`--ablate_factorization`) removes parameter p entirely (p ≡ 1).
 
-**Lịch densify** (theo 3DGS/2DGS):
+**Densification schedule** (following 3DGS/2DGS):
 
-- Từ `densify_from_iter` đến `densify_until_iter`, cứ mỗi `densification_interval` vòng: clone các Gaussian nhỏ, split các Gaussian lớn có gradient trung bình vượt ngưỡng. Khi vượt giới hạn điểm, chỉ những Gaussian có gradient mạnh nhất được nhân lên.
-- Prune khi presence < `min_presence` (0.005).
-- Mỗi `presence_reset_interval` (3000) vòng, presence bị kẹp về tối đa 0.01, như opacity reset của 3DGS.
-- Sau lần reset đầu tiên, prune Gaussian lớn hơn 10% extent, và với G_I prune thêm đĩa có bán kính trên màn hình lớn hơn `max_screen_size` (20 px). Không có bước này, vài Gaussian khổng lồ trong cảnh rộng (Wayve) phủ mọi tile và làm buffer của rasterizer phình ra.
+- From `densify_from_iter` to `densify_until_iter`, every `densification_interval` iterations: clone small Gaussians and split large Gaussians whose average gradient exceeds the threshold. When the point limit would be exceeded, only Gaussians with the strongest gradients are replicated.
+- Prune when presence < `min_presence` (0.005).
+- Every `presence_reset_interval` (3000) iterations, clamp presence to at most 0.01, as in 3DGS's opacity reset.
+- After the first reset, prune Gaussians larger than 10% of the extent; for G_I, also prune disks whose screen-space radius exceeds `max_screen_size` (20 px). Without this step, a few huge Gaussians in large scenes (Wayve) cover every tile and inflate the rasterizer buffer.
 
-Gradient dùng để densify:
-- G_I: chuẩn của gradient toạ độ màn hình (`viewspace_points.grad[:, :2]`) như 2DGS.
-- G_R: renderer theo tia không có toạ độ màn hình, nên dùng chuẩn gradient 3D của tâm đã deform nhân với extent (để ngưỡng không phụ thuộc thang đo scene), ngưỡng mặc định 2e-5.
+Gradients used for densification:
+- G_I: the norm of the screen-space coordinate gradient (`viewspace_points.grad[:, :2]`), as in 2DGS.
+- G_R: the ray-based renderer has no screen-space coordinates, so it uses the norm of the 3D gradient of the deformed center multiplied by the extent (to make the threshold independent of scene scale), with a default threshold of 2e-5.
 
 ## 4. Deformation (Eq. 1)
 
-`scene/deformation.py`, theo Yang et al. (Deformable 3D Gaussians):
+`scene/deformation.py`, following Yang et al. (Deformable 3D Gaussians):
 
 ```
 (Δμ, Δq, Δs) = MLP(γ(μ̂), γ(t))
 μ' = μ + extent · Δμ,   q' = normalize(q + Δq),   s' = exp(log s + Δs)
 ```
 
-- `μ̂ = (μ − center) / extent`. γ là positional encoding sin/cos với 2^k·π: `deform_xyz_freqs` = 6, `deform_time_freqs` = 6.
-- MLP: `deform_depth` lớp × `deform_width` (mặc định 4 × 128), ReLU. Lớp đầu ra khởi tạo bằng 0, nên mạng mới là hàm đồng nhất.
-- Tâm canonical được detach ở đầu vào, như Yang et al.: gradient vẫn tới μ qua `μ + Δμ` nhưng không đi ngược qua encoding, nhờ vậy field canonical và deformation tách được. Test `test_deformation_starts_as_identity_and_static_never_moves` kiểm tra điều này.
-- Hai trường có hai instance riêng (chung class, không chung trọng số). Chỉ hình học thay đổi theo t.
-- `warm_up` (1000 vòng) đầu mỗi phase chỉ dùng field canonical.
-- Learning rate giảm mũ tới 1% sau cả phase.
-- `static=True` (`--static_interface`, `--static_reflection`) bỏ mạng: field đứng yên theo thời gian.
+- `μ̂ = (μ − center) / extent`. γ is sin/cos positional encoding with 2^k·π: `deform_xyz_freqs` = 6, `deform_time_freqs` = 6.
+- MLP: `deform_depth` layers × `deform_width` (default 4 × 128), ReLU. The output layer is initialized to 0, so a new network is the identity function.
+- Canonical centers are detached at the input, following Yang et al.: gradients still reach μ through `μ + Δμ` but do not propagate backward through the encoding, separating the canonical field from deformation. The test `test_deformation_starts_as_identity_and_static_never_moves` checks this.
+- The two fields use separate instances (same class, no shared weights). Only geometry changes with t.
+- The initial `warm_up` (1000 iterations) of each phase uses only the canonical field.
+- The learning rate decays exponentially to 1% by the end of the phase.
+- `static=True` (`--static_interface`, `--static_reflection`) bypasses the network: the field stays fixed over time.
 
 ## 5. Phase I (Eq. 2–4)
 
 ### 5.1. Renderer (`gaussian_renderer/interface.py`)
 
-Rasterizer 2DGS `diff_surfel_anych` được build in-place trong submodule của nhánh này. `gaussian_renderer/__init__.py` đưa thư mục đó lên đầu `sys.path`, nên bản `diff_surfel_anych` đã cài trong môi trường (của RT-Splatting) không bị thay.
+The `diff_surfel_anych` 2DGS rasterizer is built in place within this branch's submodule. `gaussian_renderer/__init__.py` prepends that directory to `sys.path`, so the environment's installed copy of `diff_surfel_anych` (from RT-Splatting) is not replaced.
 
-- **Direct pass:** đĩa render với `p·o`, cho ra `B_t`, depth (expected, hoặc median theo `depth_ratio`), alpha, pháp tuyến render `N_t` (đổi sang hệ thế giới) và pháp tuyến suy từ depth `N_t^depth` (tích chéo của sai phân hàng và cột của điểm 3D chiếu ngược). `Ω_s` của Eq. 3a là các pixel có alpha > 0.1, cả lân cận 3×3 cũng được phủ, và cả hai pháp tuyến đều xác định.
-- **Surface pass** (chỉ khi cần): cùng các đĩa, render với opacity = p, mang o như một kênh phụ. `glass_map = surface_alpha − Σ w_i o_i = Σ w_i (1 − o_i)`: cao ở nơi có bề mặt (p cao) nhưng cho ánh sáng đi qua (o thấp). Chỉ dùng cho prior mask và việc trích patch; không bao giờ dùng để blend (Sec. 1: "There is no learned image-space plane mask").
-- **`DUAL_VISIABLE 1`** (`cuda_rasterizer/auxiliary.h`): pháp tuyến của mỗi đĩa được lật về phía camera, như 2DGS gốc [1]. RT-Splatting để giá trị 0. Khi đó pháp tuyến render chỉ quay về camera ở khoảng 41% pixel, trong khi pháp tuyến từ depth luôn quay về camera, và L_surf dạng L1 (Eq. 3a) phạt mỗi đĩa quay lưng khoảng 2 đơn vị.
+- **Direct pass:** disks are rendered with `p·o`, producing `B_t`, depth (expected, or median according to `depth_ratio`), alpha, rendered normals `N_t` (converted to world coordinates), and depth-derived normals `N_t^depth` (the cross product of row and column differences of back-projected 3D points). `Ω_s` in Eq. 3a consists of pixels with alpha > 0.1, whose entire 3×3 neighborhood is also covered, and where both normals are defined.
+- **Surface pass** (only when needed): the same disks, rendered with opacity = p, carrying o as an auxiliary channel. `glass_map = surface_alpha − Σ w_i o_i = Σ w_i (1 − o_i)`: high where a surface is present (high p) but transmits light (low o). Used only for the mask prior and patch extraction; never for blending (Sec. 1: "There is no learned image-space plane mask").
+- **`DUAL_VISIABLE 1`** (`cuda_rasterizer/auxiliary.h`): each disk's normal is flipped toward the camera, as in the original 2DGS [1]. RT-Splatting sets this to 0. With that setting, rendered normals face the camera at only about 41% of pixels, while depth-derived normals always face the camera, and the L1 L_surf term (Eq. 3a) penalizes each backward-facing disk by about 2 units.
 
 ### 5.2. Loss (`utils/losses.py`)
 
-Chuẩn hoá theo pixel như mục "Reading the losses" của PDF: `‖·‖₁` cộng ba kênh của một pixel, rồi chia cho số pixel hợp lệ `|Ω|`.
+Pixel normalization follows the PDF's "Reading the losses" section: `‖·‖₁` sums the three channels of a pixel, then divides by the number of valid pixels `|Ω|`.
 
 ```
 L_I = pixel_l1(B, I^clean, Ω) + λ_s · L_surf(N, N^depth, Ω_s ∩ Ω) [+ λ_glass · BCE(glass_map, M_t)] [+ λ_dssim · D-SSIM]
 ```
 
-| Thành phần | Mặc định | Ghi chú |
+| Component | Default | Notes |
 |---|---|---|
-| `λ_s` (`--lambda_surface`) | 0.05, từ vòng `surface_from_iter` = 1000 | Eq. 3a; Ω_s rỗng thì đóng góp 0 |
-| `λ_glass` (`--lambda_glass`) | 0.05 | **Không có trong Eq. 3.** Xem mục 5.3 |
-| `λ_dssim` | 0 | Tuỳ chọn; PDF bỏ SSIM |
+| `λ_s` (`--lambda_surface`) | 0.05, starting at iteration `surface_from_iter` = 1000 | Eq. 3a; contributes 0 if Ω_s is empty |
+| `λ_glass` (`--lambda_glass`) | 0.05 | **Not in Eq. 3.** See Section 5.3 |
+| `λ_dssim` | 0 | Optional; the PDF omits SSIM |
 
-### 5.3. Vì sao có prior mask kính
+### 5.3. Why a glass-mask prior is used
 
-Với ảnh clean, kính không hiện trên ảnh, nên chỉ riêng Eq. 3 không có tín hiệu nào cho biết kính nằm ở đâu. Mục Scope của PDF cũng nói p và o không tách được nếu không có prior. Nếu không có hình học kính biết trước, `S_k` phải lấy "từ hình học Phase I" (Sec. 1). Prior BCE giữa `glass_map` và mask train làm cho G_I có một lớp đĩa "có mặt nhưng trong suốt" đúng chỗ kính, để `extract_glass.py` lấy mẫu được. Prior chỉ dùng mask **train**. Mask test không bao giờ được dùng, trừ khi chấm metric vùng kính. Khi có hình học kính biết trước thì có thể đặt `--lambda_glass 0`.
+Glass is invisible in clean images, so Eq. 3 alone provides no signal indicating where it is. The PDF's Scope section also states that p and o cannot be disentangled without a prior. Without known glass geometry, `S_k` must come "from Phase I geometry" (Sec. 1). The BCE prior between `glass_map` and the training masks gives G_I a layer of "present but transparent" disks at the glass locations, which `extract_glass.py` can sample. The prior uses only **training** masks. Test masks are never used except to evaluate glass-region metrics. With known glass geometry, `--lambda_glass 0` can be used.
 
-### 5.4. Vòng lặp và output
+### 5.4. Training loop and output
 
-- View được lấy lần lượt đủ mọi view train trong mỗi epoch, thứ tự ngẫu nhiên mới mỗi epoch (`ViewSampler`).
-- SH tăng một bậc mỗi 1000 vòng. Learning rate của xyz giảm mũ như 3DGS.
-- Mỗi `test_interval` vòng: PSNR của B so với target (linear, trên Ω) và IoU của `glass_map > 0.5` với mask, trên tập test.
-- Output: `<model>/config.json` (`ModelParams`, mọi bước sau đọc lại); `<model>/interface/{config.json, latest.pth, training.jsonl, point_cloud.ply}`.
-- `--resume` chạy tiếp checkpoint. Không có `--resume` thì không ghi đè checkpoint đã có.
+- Every training view is sampled once per epoch, with a new random order each epoch (`ViewSampler`).
+- The SH degree increases by one every 1000 iterations. The xyz learning rate decays exponentially, as in 3DGS.
+- Every `test_interval` iterations: evaluate PSNR of B against the target (linear, on Ω) and IoU of `glass_map > 0.5` against the mask on the test set.
+- Output: `<model>/config.json` (`ModelParams`, read by all subsequent stages); `<model>/interface/{config.json, latest.pth, training.jsonl, point_cloud.ply}`.
+- `--resume` continues from the checkpoint. Without `--resume`, existing checkpoints are not overwritten.
 
-## 6. Mặt kính (Sec. 1, Eq. 9)
+## 6. Glass surfaces (Sec. 1, Eq. 9)
 
-### 6.1. Định dạng
+### 6.1. Format
 
 `<model>/glass_geometry.json`:
 
@@ -168,215 +168,217 @@ Với ảnh clean, kính không hiện trên ảnh, nên chỉ riêng Eq. 3 khô
  "accepted": true}
 ```
 
-Mặt phẳng là `nᵀx + d = 0`. `vertices` là một đa giác lồi có thứ tự, nằm trên mặt phẳng. `validate_patches` chuẩn hoá n và từ chối: pháp tuyến bằng 0, đỉnh không đồng phẳng, đa giác có diện tích 0, đa giác không lồi. Hình học biết trước được truyền bằng `--glass_geometry <file>` (một danh sách patch, hoặc dict có khoá `patches`).
+The plane is `nᵀx + d = 0`. `vertices` is an ordered convex polygon lying on the plane. `validate_patches` normalizes n and rejects normals equal to 0, non-coplanar vertices, polygons with area 0, and non-convex polygons. Known geometry is supplied with `--glass_geometry <file>` (a patch list, or a dict with a `patches` key).
 
-### 6.2. Trích từ Phase I (`utils/patch_extraction.py`)
+### 6.2. Extraction from Phase I (`utils/patch_extraction.py`)
 
-1. **Lấy mẫu.** Trên khoảng 12 view train, surface pass của G_I đã đóng băng cho depth của bề mặt "có mặt" đầu tiên. Những pixel vừa nằm trong mask kính train, vừa có `surface_alpha > 0.3` và `glass_map > 0.1`, được chiếu ngược ra 3D (tối đa `plane_max_points` = 12000 điểm).
-2. **Mặt phẳng.** Chạy RANSAC tuần tự (512 giả thuyết, ngưỡng `plane_threshold × extent`), tinh chỉnh bằng SVD trên các inlier, bỏ inlier, rồi lặp lại tới `max_patches` (4) mặt phẳng.
-3. **Patch.** Các inlier đồng phẳng được tách thành thành phần liên thông: union-find trên đồ thị bán kính bằng 8 lần khoảng cách láng giềng trung vị, trong toạ độ mặt phẳng. Mỗi thành phần đủ lớn thành một convex hull. Nhờ vậy các ô kính rời nhau trên cùng một bức tường thành các patch riêng.
-4. **Định hướng.** Pháp tuyến được lật về phía có đa số camera. Dấu này không ảnh hưởng tới phương trình (`cos θ` lấy trị tuyệt đối, phép phản xạ không đổi khi n đổi dấu), nhưng làm file dễ đọc hơn.
-5. **Chất lượng.** Giao các patch với tia của các view mẫu (có kiểm tra che khuất), rồi so với mask: `coverage = |hit ∩ mask| / |mask|`, `precision = |hit ∩ mask| / |hit|`. Dưới `plane_min_coverage` hoặc `plane_min_precision` (0.5) thì file được ghi với `"accepted": false`, `extract_glass.py` kết thúc với lỗi, và Phase II từ chối chạy.
+1. **Sampling.** Across about 12 training views, the surface pass of frozen G_I gives the depth of the first "present" surface. Pixels inside the training glass mask with both `surface_alpha > 0.3` and `glass_map > 0.1` are back-projected into 3D (up to `plane_max_points` = 12000 points).
+2. **Planes.** Run sequential RANSAC (512 hypotheses, threshold `plane_threshold × extent`), refine using SVD on the inliers, remove the inliers, and repeat for up to `max_patches` (4) planes.
+3. **Patches.** Split coplanar inliers into connected components: union-find on a radius graph with a radius of 8 times the median neighbor distance, in plane coordinates. Each sufficiently large component becomes a convex hull. This produces separate patches for disconnected panes on the same wall.
+4. **Orientation.** Flip normals toward the side containing the majority of cameras. This sign does not affect the equations (`cos θ` uses an absolute value, and reflection is unchanged when n changes sign), but makes the file easier to read.
+5. **Quality.** Intersect the patches with rays from the sampled views (with occlusion checks), then compare against the masks: `coverage = |hit ∩ mask| / |mask|`, `precision = |hit ∩ mask| / |hit|`. Below `plane_min_coverage` or `plane_min_precision` (0.5), the file is written with `"accepted": false`, `extract_glass.py` exits with an error, and Phase II refuses to run.
 
-`<model>/glass_preview/<view>.png`: xanh lá là mask không bị patch nào phủ, đỏ là hit ngoài mask, vàng là hit nằm trong mask, xanh dương là hit bị che khuất.
+`<model>/glass_preview/<view>.png`: green indicates mask pixels not covered by any patch, red indicates hits outside the mask, yellow indicates hits inside the mask, and blue indicates occluded hits.
 
-Giới hạn: ảnh clean và silhouette không xác định duy nhất độ sâu của kính trong suốt (Scope của PDF). Vì vậy residual và độ khớp với mask chỉ là phép kiểm, không phải ground truth. Convex hull chỉ xấp xỉ biên. Kính có lỗ hoặc kính cong cần hình học biết trước.
+Limitations: clean images and silhouettes do not uniquely determine the depth of transparent glass (PDF Scope). Therefore, residuals and agreement with the mask are only checks, not ground truth. A convex hull only approximates the boundary. Glass with holes or curved glass requires known geometry.
 
-### 6.3. FirstHit và kiểm tra che khuất (Eq. 9)
+### 6.3. FirstHit and occlusion checks (Eq. 9)
 
-`first_hit(view, patches, epsilon, occlusion)` làm các bước sau cho mọi pixel:
+`first_hit(view, patches, epsilon, occlusion)` performs the following steps for every pixel:
 
-1. Bắn tia camera (hướng đơn vị d), giao với từng mặt phẳng, chỉ giữ giao điểm có khoảng cách > ε nằm trong đa giác `S_k`. Chọn giao điểm gần nhất, tức "the nearest hit if projections overlap".
-2. **Kiểm tra che khuất** (bạn đã chọn phương án A). Eq. 9 chỉ xét các patch. Một tấm kính nằm sau vật đục (người đứng trước cửa kính) vẫn được chọn, và phản xạ bị blend đè lên vật đó. Vì vậy một hit bị loại khi **lượt render che khuất** của G_I đã đóng băng **đục** ở pixel đó (`alpha ≥ occlusion_alpha` = 0.5) **và** depth của nó nằm **trước** kính: `depth < z_hit · (1 − occlusion_tolerance)`, với `occlusion_tolerance` = 0.02 tương đối.
-   - **Lượt render che khuất** (`utils/model_io.DirectPass`) là direct pass của G_I sau khi **bỏ các đĩa nằm trên chính các patch kính**: những đĩa cách mặt phẳng một patch không quá `glass_margin` (= ngưỡng RANSAC `plane_threshold × extent`) và có hình chiếu nằm trong đa giác (`on_patches`). Các đĩa đó là lớp kính. Với ảnh clean còn sót phản chiếu (DAI), Phase I "vẽ" phần sót đó lên đúng lớp này, làm nó hơi đục. Nếu tính cả lớp này, chỉ cần sai số fit mặt phẳng là depth của nó đã nằm trước patch, và kính thật bị báo là bị che. Lần chạy thử trên 3D-FRONT-T scene_1 cho thấy đúng hiện tượng này (mục 13). B dùng để blend vẫn là direct pass đầy đủ.
-   - Ở pixel kính không bị che, depth của lượt render che khuất là depth của thứ nằm **sau** kính, nên hit được giữ. Một bề mặt nằm ngay tại hoặc sau kính không bao giờ bị coi là vật che.
-   - Đây chỉ là hình học đã dựng lại: không có mask học được, không có tham số mới.
-   - `--ablate_occlusion` (chọn lúc `extract_glass.py`, lưu trong `settings`) trả về Eq. 9 nguyên văn.
-3. Trả về các map (H, W): `patch` (int32, −1 là không có kính), `visible`, `occluded`, `distance`, `cosine = |nᵀd|` (Eq. 10), và các map (H, W, 3): `hits` x_t(u), `normals`, `real_directions` d, `reflected` r (Eq. 9a).
+1. Cast a camera ray (unit direction d), intersect it with each plane, and keep only intersections at a distance > ε inside polygon `S_k`. Select the nearest intersection, i.e., "the nearest hit if projections overlap".
+2. **Occlusion check** (you selected option A). Eq. 9 considers only patches. A glass pane behind an opaque object (a person in front of a glass door) is still selected, causing reflections to be blended over that object. Therefore, a hit is rejected when the **occlusion pass** of frozen G_I is **opaque** at that pixel (`alpha ≥ occlusion_alpha` = 0.5) **and** its depth is **in front of** the glass: `depth < z_hit · (1 − occlusion_tolerance)`, with relative `occlusion_tolerance` = 0.02.
+   - The **occlusion pass** (`utils/model_io.DirectPass`) is G_I's direct pass after **excluding disks lying on the glass patches themselves**: disks within `glass_margin` (= the RANSAC threshold `plane_threshold × extent`) of a patch plane whose projections lie inside the polygon (`on_patches`). These disks form the glass layer. When clean images retain residual reflections (DAI), Phase I "paints" that residual onto this layer, making it slightly opaque. If this layer is included, even a plane-fitting error can place its depth in front of the patch, falsely marking real glass as occluded. The trial run on 3D-FRONT-T scene_1 showed exactly this behavior (Section 13). B used for blending remains the full direct pass.
+   - At unoccluded glass pixels, the occlusion-pass depth belongs to whatever lies **behind** the glass, so the hit is retained. A surface at or behind the glass is never treated as an occluder.
+   - This uses only reconstructed geometry: no learned mask and no new parameters.
+   - `--ablate_occlusion` (selected in `extract_glass.py`, saved in `settings`) restores Eq. 9 verbatim.
+3. Return (H, W) maps: `patch` (int32, −1 means no glass), `visible`, `occluded`, `distance`, `cosine = |nᵀd|` (Eq. 10), and (H, W, 3) maps: `hits` x_t(u), `normals`, `real_directions` d, `reflected` r (Eq. 9a).
 
-Luật này được dùng **giống hệt nhau** khi trích patch (đo quality), khi khởi tạo và train Phase II, và khi render.
+This rule is applied **identically** during patch extraction (quality measurement), Phase II initialization and training, and rendering.
 
 ## 7. Phase II (Eq. 5–8, 11)
 
-### 7.1. Tia phản xạ và camera ảo động V_dyn
+### 7.1. Reflected rays and dynamic virtual camera V_dyn
 
-Với một pixel kính: `r = d − 2(nᵀd) n` (Eq. 9a). Tia đúng vật lý là `x_t(u) + s·r_t(u)`, `s ≥ 0` (Sec. 3, "Render").
+For a glass pixel: `r = d − 2(nᵀd) n` (Eq. 9a). The physically correct ray is `x_t(u) + s·r_t(u)`, `s ≥ 0` (Sec. 3, "Render"). It leaves the glass back toward **the same side as the real camera**. G_R lives on that side, in ordinary world coordinates, at the true positions of the reflected objects. It is never mirrored across the glass.
 
-`dynamic_virtual_camera` triển khai Eq. 9b cho từng patch nhìn thấy được:
-- `u_ref` là pixel của vùng nằm gần vị trí pixel trung bình của vùng nhất.
-- `c_v = x(u_ref) + ε r(u_ref)`.
-- `Q_v = LookAt(r(u_ref), h_t)`: phép quay đúng (det = +1) với trục x phải, y xuống, z theo r. Hướng "up" lấy từ camera thật (−y của camera thật trong hệ thế giới).
-- Hàm này là một và chỉ một: với mỗi vùng/patch, nó đặt lại pose cho cùng một camera, không lưu camera riêng cho từng patch.
+`dynamic_virtual_camera` implements Eq. 9b for each visible patch:
+- `u_ref` is the region's pixel nearest its mean pixel position.
+- `c_v = x(u_ref) + ε r(u_ref)`: the virtual camera sits on the glass, offset by ε along the reflected direction, so it is on the same side as the real camera and G_R.
+- `Q_v = LookAt(r(u_ref), h_t)`: a proper rotation (det = +1) with x pointing right, y down, and z along r, i.e., the virtual camera looks away from the glass, toward G_R. The "up" direction comes from the real camera (the real camera's −y axis in world coordinates).
+- This is a single camera: for each region/patch, the function resets the pose of the same camera, rather than storing a separate camera for each patch.
 
-Tính chất quan trọng: trong một patch phẳng, **mọi tia phản xạ đều đi qua tâm camera đối xứng** `c'_k = mirror_k(c)` khi kéo dài ngược lại (test `test_dynamic_virtual_camera_pose_and_mirrored_center`). Tức là tập tia đúng của một patch là một phép chiếu tâm (từ `c'_k`), chỉ có điều tia bắt đầu tại mặt kính. Union các tia qua nhiều patch thì không còn chung tâm, đúng như PDF nói ("non-central rays").
+A geometric property used for binning (Section 7.4), **not** a camera placement: within a planar patch, all reflected rays, when extended **backward** through the glass, meet at one point, `c'_k = mirror_k(c)`, the real camera center mirrored across the patch plane (`mirrored_center`, test `test_dynamic_virtual_camera_pose_and_mirrored_center`). `c'_k` lies behind the glass and no ray is ever cast from it. It only means that a patch's exact ray bundle has the directions of a central projection from `c'_k`, while the rays themselves start at the glass surface and travel toward G_R. The union of rays across multiple patches no longer shares such a point, as stated in the PDF ("non-central rays").
 
-### 7.2. Ba chế độ tia (`ray_bundle`)
+### 7.2. Three ray modes (`ray_bundle`)
 
-| Chế độ | Gốc tia | Hướng | Dùng cho |
+| Mode | Ray origin | Direction | Purpose |
 |---|---|---|---|
-| `exact` (mặc định) | `x_t(u) + ε r` | `r_t(u)` | Renderer của framework |
-| `pinhole` (`--pinhole_virtual_camera`) | `c_v` của vùng (Eq. 9b) | `r_t(u)` | Xấp xỉ mà PDF nhắc tới: "using that pose alone in an ordinary pinhole rasterizer is generally only an approximation". Sai số thị sai lớn với vật ở gần kính |
-| `unreflected` (`--ablate_virtual_camera`) | `x_t(u) + ε d` | `d_t(u)` | Không có camera ảo: G_R được nhìn thẳng xuyên qua kính |
+| `exact` (default) | `x_t(u) + ε r` | `r_t(u)` | Framework renderer |
+| `pinhole` (`--pinhole_virtual_camera`) | The region's `c_v` (Eq. 9b) | `r_t(u)` | The approximation mentioned in the PDF: "using that pose alone in an ordinary pinhole rasterizer is generally only an approximation". Large parallax errors for objects near the glass |
+| `unreflected` (`--ablate_virtual_camera`) | `x_t(u) + ε d` | `d_t(u)` | No virtual camera: rays are not reflected and continue straight through the glass, so G_R is seen behind the glass instead of on the camera side |
 
-Test `test_a_gaussian_in_front_of_the_glass_appears_at_its_mirror_image` đặt một Gaussian nhỏ trước kính. Với tia `exact`, pixel sáng nhất là hình chiếu của ảnh gương của nó, sai số ≤ 1 px. Với `pinhole`, nó lệch hơn 2 px.
+In `exact` and `pinhole` modes the rays travel from the glass toward the camera side, where G_R is. The test `test_a_gaussian_in_front_of_the_glass_appears_at_its_mirror_image` places a small Gaussian of G_R in front of the glass (on the camera side) and leaves it there. With `exact` rays, its reflection appears at the brightest pixel, which matches, with error ≤ 1 px, the pixel where the real camera would see the Gaussian's mirror image. This is where a real reflection appears. With `pinhole`, it is displaced by more than 2 px.
 
-### 7.3. Renderer theo tia (CUDA, từ `quan_dang`)
+### 7.3. Ray-based renderer (CUDA, from `quan_dang`)
 
 `diff_surfel_anych.render_reflected_rays` (`rasterize_points.cu`):
-- Với mỗi pixel và mỗi Gaussian ứng viên của tile, tìm điểm trên tia gần tâm Gaussian nhất theo metric của Gaussian (`A = R / s`). Gaussian bị bỏ nếu điểm đó nằm sau gốc tia (`s ≤ 0`, đúng điều kiện `s ≥ 0` của PDF) hoặc ngoài bán kính `ray_cutoff` (3.5σ).
-- `α = min(0.99, o · exp(−q/2))`, composite từ trước ra sau, dừng khi T < 1e-4.
-- Backward tính gradient theo tâm, ma trận trục nghịch đảo (sau đó PyTorch đưa về rotation, scale và deformation), opacity và màu. Test so forward và gradient với một bản tham chiếu PyTorch viết độc lập.
-- Xấp xỉ (giống 3DGS): thứ tự composite theo depth của tâm Gaussian trong tile (theo trục của camera đối xứng), đánh giá Gaussian tại điểm gần nhất thay vì tích phân thể tích. Không mô hình khúc xạ, phản xạ nhiều lần, hay nhiều lần giao với kính.
+- For each pixel and each candidate Gaussian in the tile, find the point on the ray closest to the Gaussian center under the Gaussian's metric (`A = R / s`). Discard the Gaussian if that point lies behind the ray origin (`s ≤ 0`, following the PDF's `s ≥ 0` condition) or outside `ray_cutoff` (3.5σ).
+- `α = min(0.99, o · exp(−q/2))`, composite front to back, stop when T < 1e-4.
+- The backward pass computes gradients with respect to centers, inverse-axis matrices (then propagated by PyTorch to rotation, scale, and deformation), opacity, and color. Tests compare the forward pass and gradients against an independently written PyTorch reference.
+- Approximations (as in 3DGS): compositing order follows Gaussian-center depth within the tile (the real-camera depth of `mirror_k(μ)`, Section 7.4, which approximates the order along the reflected rays), and Gaussians are evaluated at the closest point rather than through volume integration. Refraction, multiple reflections, and multiple glass intersections are not modeled.
 
-### 7.4. Danh sách ứng viên theo tile (`tile_candidates`)
+### 7.4. Tile candidate lists (`tile_candidates`)
 
-Pixel mà tia của nó đi qua một điểm P chính là hình chiếu qua camera thật của:
-- `mirror_k(P)` với chế độ `exact` (vì camera đối xứng chính là ảnh gương của camera thật);
-- `mirror_k(P + c'_k − c_v)` với chế độ `pinhole` (tia pinhole là tia exact tịnh tiến đi `c_v − c'_k`);
-- `P` với chế độ `unreflected`.
+To build tile lists, the code must know which pixel's ray passes through a Gaussian center P. P is a point of G_R, on the camera side of the glass. Mirroring is used **only to find that pixel**: neither G_R nor the virtual camera is moved. The pixel is the real-camera projection of:
+- `mirror_k(P)` in `exact` mode. Mirroring the reflected ray `x_t(u) + s·r` across the patch plane gives `x_t(u) + s·d`, the real camera ray of the same pixel continued through the glass. So the reflected ray of pixel u passes through P exactly when the real ray of u passes through `mirror_k(P)`, which lies behind the glass. This is the same fact as the rays meeting at `c'_k = mirror_k(c)` when extended backward (Section 7.1);
+- `mirror_k(P + c'_k − c_v)` in `pinhole` mode (a pinhole ray is an exact ray translated by `c_v − c'_k`);
+- `P` in `unreflected` mode (no reflection).
 
-Mỗi Gaussian được bao bằng một hình cầu bán kính `ray_cutoff × max scale`. Hình chiếu bảo thủ của nó cho dải tile, chỉ giữ những tile mà patch đó thật sự xuất hiện. Các entry `k·N + i` được sắp theo (tile, depth) bằng một khoá 64 bit. Tổng số cặp (Gaussian, tile) vượt `--max_tile_entries` là lỗi rõ ràng, không lặng lẽ bỏ Gaussian. Test kiểm tra rằng với cả ba chế độ, mọi Gaussian bị tia cắt đều có trong danh sách của tile.
+The sort depth is the real-camera depth of the same mapped point. In `exact` mode, this approximates the distance along the reflected rays from the glass toward G_R.
 
-Màu là SH của từng Gaussian theo hướng tia tới nó, `normalize(μ − tâm tia của patch)`. Một Gaussian thấy qua hai patch vì vậy có hai màu phụ thuộc hướng nhìn. Bức xạ linear không âm và có thể vượt 1 trước khi blend.
+Each Gaussian is bounded by a sphere of radius `ray_cutoff × max scale`. Its conservative projection gives a tile range, retaining only tiles where that patch actually appears. Entries `k·N + i` are sorted by (tile, depth) using a 64-bit key. Exceeding `--max_tile_entries` total (Gaussian, tile) pairs raises an explicit error rather than silently dropping Gaussians. Tests verify that, in all three modes, every Gaussian intersected by a ray appears in the tile's candidate list.
 
-### 7.5. Trọng số phản xạ và blend (`gaussian_renderer/composition.py`)
+Color is each Gaussian's SH evaluated along the ray direction toward it, `normalize(μ − patch ray center)`. A Gaussian seen through two patches therefore has two view-dependent colors. Linear radiance is nonnegative and may exceed 1 before blending.
+
+### 7.5. Reflection weight and blending (`gaussian_renderer/composition.py`)
 
 ```
-F0 = ((η_a − η_g)/(η_a + η_g))²,   F(θ) = F0 + (1 − F0)(1 − cos θ)⁵        (η_a = 1.0, η_g = 1.5, nên F0 = 0.04)
-α = clip_[0,1](F(θ) + h_ψ) trên pixel kính được chọn, 0 ở các pixel khác
+F0 = ((η_a − η_g)/(η_a + η_g))²,   F(θ) = F0 + (1 − F0)(1 − cos θ)⁵        (η_a = 1.0, η_g = 1.5, so F0 = 0.04)
+α = clip_[0,1](F(θ) + h_ψ) on selected glass pixels, 0 elsewhere
 Î = (1 − α) B + α R
 ```
 
-**h_ψ** (`OpticalCorrection`, bật mặc định theo Eq. 7–8; `--pure_fresnel` để tắt):
-- Đầu vào: `γ(x̂_t(u))` (điểm kính bị tia của pixel cắt, chuẩn hoá theo center/extent, 4 tần số), `γ(t)` (2 tần số) và `cos θ`. MLP 2 lớp ẩn × 64, lớp ra khởi tạo bằng 0, nên ban đầu là Fresnel thuần. Chỉ tính trên pixel kính; ngoài kính h = 0.
-- PDF viết `h_ψ(u, t)`. Khi đã biết camera thì `x_t(u)` là hàm của u, nên đây vẫn là `h_ψ(u, t)`. Khác với toạ độ pixel thô (`quan_dang` dùng (u, v) chuẩn hoá), `x_t(u)` chỉ đúng **cùng một chỗ trên kính** ở mọi view, nên hiệu chỉnh học ở view train áp được lên view test.
-- `--optical_bound` mặc định 0: không chặn, chỉ có `clip[0,1]` của Eq. 11 và `L_opt`. Giá trị > 0 thì chặn bằng `bound · tanh(h / bound)`. `quan_dang` chặn cứng ±0.1.
+**h_ψ** (`OpticalCorrection`, enabled by default according to Eq. 7–8; `--pure_fresnel` disables it):
+- Inputs: `γ(x̂_t(u))` (the glass point intersected by the pixel's ray, normalized by center/extent, 4 frequencies), `γ(t)` (2 frequencies), and `cos θ`. MLP with 2 hidden layers × 64, output layer initialized to 0, so it starts as pure Fresnel. Evaluated only on glass pixels; h = 0 outside glass.
+- The PDF writes `h_ψ(u, t)`. Given the camera, `x_t(u)` is a function of u, so this is still `h_ψ(u, t)`. Unlike raw pixel coordinates (`quan_dang` used normalized (u, v)), `x_t(u)` identifies **the same location on the glass** across views, allowing corrections learned on training views to transfer to test views.
+- `--optical_bound` defaults to 0: unbounded, with only Eq. 11's `clip[0,1]` and `L_opt`. A value > 0 applies `bound · tanh(h / bound)`. `quan_dang` imposed a fixed ±0.1 bound.
 
-`--ablate_fresnel`: thay F(θ) bằng một hằng số học được `σ(c)` cho mọi pixel kính, khởi tạo bằng F0. Nếu h_ψ đang bật thì nó cộng lên trên hằng số đó.
+`--ablate_fresnel`: replace F(θ) with a learned constant `σ(c)` shared by all glass pixels, initialized to F0. If h_ψ is enabled, it is added to that constant.
 
-### 7.6. Khởi tạo G_R
+### 7.6. G_R initialization
 
-Trên khoảng 12 view train, lấy ngẫu nhiên các pixel kính hợp lệ, đặt một điểm tại `gốc tia + s · hướng tia` với `s ∈ extent · [0.1, 3.1]` (theo chế độ tia đang dùng), màu `(I − (1 − F) B) / F`, kẹp trong [0, 20]. Đó là bức xạ có thể tự mình giải thích phần dư. Opacity 0.1, scale theo láng giềng gần nhất.
+Across about 12 training views, randomly sample valid glass pixels and place a point at `ray origin + s · ray direction`, with `s ∈ extent · [0.1, 3.1]` (using the active ray mode), and color `(I − (1 − F) B) / F`, clamped to [0, 20]. This is the radiance that could explain the residual on its own. Opacity is 0.1, and scale is based on the nearest neighbor.
 
-### 7.7. Loss và vòng lặp (`train_reflection.py`)
+### 7.7. Loss and training loop (`train_reflection.py`)
 
 ```
 L_R = pixel_l1(Î, I, Ω) + λ_m · motion_loss(Î_k, Î_{k−1}, I_k, I_{k−1}, Ω_k ∩ Ω_{k−1}) + λ_o · optical_loss(h, Ω)
 ```
 
-- **L_motion (Eq. 7a–7b):** frame k−1 là frame liền trước trong **cùng sequence (`source_clip`) và cùng camera (`sensor_id`)** theo thời gian (`previous_frames`). VSGD 0758 có hai clip, nên frame đầu của mỗi clip không có frame liền trước. Cả hai dự đoán đều được render và đều nhận gradient. Đây là ràng buộc trên độ thay đổi của ảnh, không phải phạt độ lớn deformation. Mặc định `λ_m` = 0.1.
-- **L_opt (Eq. 7c):** trung bình h² trên Ω (h = 0 ngoài kính), `λ_o` = 0.01, chỉ khi có h_ψ.
-- G_I, D_I và các patch hoàn toàn cố định. `DirectPass` render B_t và lượt render che khuất (depth, alpha) một lần cho mỗi view rồi cache trong RAM (LRU, `--cache_views` = 32), vì Phase II không bao giờ đổi chúng. Ảnh clean không được nạp ở Phase II.
-- Optimizer: Adam cho G_R (lr theo 3DGS), cho D_R (`deform_lr`, giảm mũ), cho h_ψ / hằng số (`optical_lr` = 1e-3).
-- Mỗi `test_interval` vòng, trên tập test: PSNR của composite và của direct, toàn ảnh và vùng kính (linear, Ω). Hiệu giữa hai PSNR là phần mà phản xạ giải thích được.
+- **L_motion (Eq. 7a–7b):** frame k−1 is the immediately preceding frame in time from **the same sequence (`source_clip`) and the same camera (`sensor_id`)** (`previous_frames`). VSGD 0758 has two clips, so the first frame of each clip has no predecessor. Both predictions are rendered, and both receive gradients. This constrains image changes rather than penalizing deformation magnitude. Default `λ_m` = 0.1.
+- **L_opt (Eq. 7c):** mean h² over Ω (h = 0 outside glass), `λ_o` = 0.01, only when h_ψ is present.
+- G_I, D_I, and the patches are completely fixed. `DirectPass` renders B_t and the occlusion pass (depth, alpha) once per view and caches them in RAM (LRU, `--cache_views` = 32), since Phase II never changes them. Clean images are not loaded in Phase II.
+- Optimizers: Adam for G_R (3DGS learning rates), for D_R (`deform_lr`, exponential decay), and for h_ψ / the constant (`optical_lr` = 1e-3).
+- Every `test_interval` iterations, evaluate composite and direct PSNR on the test set, over the whole image and the glass region (linear, Ω). The difference between the two PSNR values indicates the contribution explained by reflections.
 - Output: `<model>/reflection/{config.json, latest.pth, training.jsonl, point_cloud.ply}`.
 
-## 8. Suy luận (`render.py`, Eq. 12–13)
+## 8. Inference (`render.py`, Eq. 12–13)
 
-- Nạp Phase I, Phase II (cấu hình từ `reflection/config.json`) và `glass_geometry.json`. Mỗi pixel chọn patch kính nhìn thấy đầu tiên theo đúng luật lúc train. **Mask test không bao giờ được dùng để blend.**
-- Output `<model>/<split>/ours_<iter>/{renders, gt, glass_masks, valid_masks}`.
-- `--components` thêm: `direct/`, `reflection/`, `alpha/`, `patches/` (màu theo patch được chọn), `clean/` (ảnh clean của view, cho metric tách lớp), `virtual_cameras.json` (pose V_dyn của mỗi patch nhìn thấy được ở mỗi frame).
-- `--direct_only` (tự bật với ablation no-separation) render `direct_<iter>`.
-- `comparison.mp4`: ours bên trái, GT bên phải, theo thứ tự sequence, camera, thời gian.
-- `render_stats.json`: thời gian render mỗi frame đo bằng CUDA event, gồm direct pass, FirstHit, renderer tia và blend; không gồm nạp dữ liệu và ghi file.
+- Load Phase I, Phase II (configuration from `reflection/config.json`), and `glass_geometry.json`. Each pixel selects the first visible glass patch using the same rule as training. **Test masks are never used for blending.**
+- Output: `<model>/<split>/ours_<iter>/{renders, gt, glass_masks, valid_masks}`.
+- `--components` additionally saves: `direct/`, `reflection/`, `alpha/`, `patches/` (colored by selected patch), `clean/` (the view's clean image, for layer-separation metrics), `virtual_cameras.json` (V_dyn poses for each visible patch in each frame).
+- `--direct_only` (automatically enabled for the no-separation ablation) renders `direct_<iter>`.
+- `comparison.mp4`: ours on the left, GT on the right, ordered by sequence, camera, and time.
+- `render_stats.json`: per-frame rendering time measured using CUDA events, including the direct pass, FirstHit, ray renderer, and blending; excluding data loading and file writing.
 
-## 9. Metric (`metrics.py`)
+## 9. Metrics (`metrics.py`)
 
-Chấm trên PNG sRGB, từng view một:
+Evaluated on sRGB PNGs, one view at a time:
 
-| Metric | Định nghĩa |
+| Metric | Definition |
 |---|---|
-| PSNR, SSIM, LPIPS | Toàn ảnh so với ảnh gốc (LPIPS VGG, đầu vào [−1, 1]) |
-| Valid PSNR | Chỉ trên Ω |
-| Glass PSNR / Opaque PSNR | Pixel kính / không kính được annotate trong Ω, chia cho đúng số pixel đó |
-| Masked PSNR/SSIM/LPIPS (RT) | Nhân cả hai ảnh với mask rồi tính trung bình toàn ảnh, theo giao thức RT-Splatting (nền 0 làm số bị thổi phồng) |
-| LPIPS (RT input) | LPIPS với đầu vào [0, 1], quy ước của RT-Splatting |
-| **Transmission PSNR**, Glass Transmission PSNR | B so với ảnh clean (cần `--components`): lớp không phản chiếu được khôi phục tốt đến đâu |
-| FPS, Training Time | Từ `render_stats.json` và `<phase>/training.jsonl` (cộng qua các session resume) |
+| PSNR, SSIM, LPIPS | Whole image against the original image (LPIPS VGG, input [−1, 1]) |
+| Valid PSNR | Only on Ω |
+| Glass PSNR / Opaque PSNR | Annotated glass / non-glass pixels within Ω, divided by the corresponding pixel count |
+| Masked PSNR/SSIM/LPIPS (RT) | Multiply both images by the mask, then average over the whole image, following RT-Splatting's protocol (background values of 0 inflate scores) |
+| LPIPS (RT input) | LPIPS with input [0, 1], RT-Splatting's convention |
+| **Transmission PSNR**, Glass Transmission PSNR | B against the clean image (requires `--components`): how well the non-reflective layer is recovered |
+| FPS, Training Time | From `render_stats.json` and `<phase>/training.jsonl` (summed across resumed sessions) |
 
-Transmission PSNR là thước đo cho chính việc tách lớp. PSNR so với ảnh gốc ưu tiên những phương pháp khớp thẳng ảnh gốc (ví dụ RT-Splatting, hoặc ablation `no_separation`), nên một mình nó không đủ để đánh giá VIGOR-GS.
+Transmission PSNR measures layer separation itself. PSNR against the original images favors methods that directly fit those images (e.g., RT-Splatting or the `no_separation` ablation), so it is insufficient on its own to evaluate VIGOR-GS.
 
-## 10. Cấu hình, checkpoint, resume
+## 10. Configuration, checkpoints, and resume
 
-- `arguments/__init__.py`: `ModelParams` (scene, độ phân giải, kiến trúc, ablation của Phase I), `PipelineParams`, `InterfaceOptimizationParams`, `GlassParams`, `ReflectionParams` (model Phase II và ablation), `ReflectionOptimizationParams`.
-- Phase I ghi `ModelParams` vào `<model>/config.json`. Các bước sau parse `ModelParams` với `sentinel=True` và `load_model_args` chỉ ghi đè những gì được truyền tường minh. Đổi kiến trúc của Phase I (SH, deformation, ablation Phase I) ở bước sau là lỗi.
-- Checkpoint (`utils/checkpoint_utils.py`, version 2) gồm: field, optimizer và moment của nó, deformation và optimizer của nó, module phụ (h_ψ, hằng số Fresnel) và optimizer của chúng, trạng thái RNG. File được ghi tạm rồi `os.replace`. Resume chạy tiếp đúng từng bit (`test_checkpoint_resume_continues_exactly`).
-- Không có `--resume` thì một checkpoint đã có không bao giờ bị ghi đè.
+- `arguments/__init__.py`: `ModelParams` (scene, resolution, architecture, Phase I ablations), `PipelineParams`, `InterfaceOptimizationParams`, `GlassParams`, `ReflectionParams` (Phase II model and ablations), `ReflectionOptimizationParams`.
+- Phase I writes `ModelParams` to `<model>/config.json`. Subsequent stages parse `ModelParams` with `sentinel=True`, and `load_model_args` overrides only explicitly supplied arguments. Changing the Phase I architecture (SH, deformation, Phase I ablations) in a later stage is an error.
+- Checkpoints (`utils/checkpoint_utils.py`, version 2) include: the field, its optimizer and moments, deformation and its optimizer, auxiliary modules (h_ψ, the Fresnel constant) and their optimizers, and RNG state. Files are written to a temporary path, then committed with `os.replace`. Resume continues bit for bit (`test_checkpoint_resume_continues_exactly`).
+- Without `--resume`, an existing checkpoint is never overwritten.
 
-## 11. Lệnh
+## 11. Commands
 
-Build extension (một lần, và sau mỗi lần sửa CUDA hoặc header):
+Build the extension (once, and after each CUDA or header change):
 
 ```bash
 cd submodules/diff-surfel-anych
 rm -rf build && CUDA_HOME=/usr/local/cuda-12.6 TORCH_CUDA_ARCH_LIST=8.6 python setup.py build_ext --inplace
 ```
 
-Phải `rm -rf build` khi chỉ sửa header (ví dụ `auxiliary.h`): ninja không tự build lại khi header đổi.
+You must run `rm -rf build` when changing only a header (e.g., `auxiliary.h`): ninja does not automatically rebuild after header changes.
 
-Chạy cả chuỗi:
+Run the full pipeline:
 
 ```bash
 python train.py -s data/datasets/datasets/3D-FRONT-T/scene_1 -m output/3dfront_full -r 2
-python train.py -s <scene> -m <model> --glass_geometry patches.json        # hình học kính biết trước
+python train.py -s <scene> -m <model> --glass_geometry patches.json        # known glass geometry
 python train.py -s <scene> -m <model> --reflection_args "--iterations 20000 --lambda_motion 0.05"
 ```
 
-Từng bước:
+Individual stages:
 
 ```bash
 python train_interface.py -s <scene> -m <model> -r 2
-python extract_glass.py -m <model>                  # hoặc --glass_geometry patches.json
+python extract_glass.py -m <model>                  # or --glass_geometry patches.json
 python train_reflection.py -m <model>
 python render.py -m <model> --skip_train --components
 python metrics.py -m <model>
 ```
 
-Bộ ablation: `python run_ablations.py -s <scene> --root output/<scene>_ablations -r 2` (xem `docs/ablations.md`).
+Ablation suite: `python run_ablations.py -s <scene> --root output/<scene>_ablations` (resolution chosen per dataset: `-r 1` for VSGD and 3D-FRONT-T, `-r 2` for WayveScene101; see `docs/ablations.md`).
 
-Test: `python -m pytest`, gồm 50 test với scene tổng hợp `tests/synthetic.py`. Test GPU bị skip khi không có CUDA. Đánh dấu `slow` cho các test có train ngắn.
+Tests: `python -m pytest`, including 50 tests using the synthetic scene in `tests/synthetic.py`. GPU tests are skipped when CUDA is unavailable. Tests with short training runs are marked `slow`.
 
-## 12. Những chỗ code chọn hoặc thêm so với PDF
+## 12. Interpretations and additions relative to the PDF
 
-| Chỗ | PDF | Code | Lý do |
+| Area | PDF | Code | Reason |
 |---|---|---|---|
-| Che khuất trong FirstHit | Eq. 9 chỉ xét các patch | Loại hit khi depth của G_I đã đóng băng (không tính lớp đĩa nằm trên kính) nằm trước kính | Bạn đã chọn phương án A; ablation `no_occlusion` |
-| Prior mask kính ở Phase I | Eq. 3 chỉ có L1 + λ_s L_surf | Thêm λ_glass · BCE(glass_map, M_t) | Cần có hình học kính để trích `S_k` từ Phase I (Sec. 1, Scope). Tắt được khi có hình học biết trước |
-| Nguồn của `S_k` | "known geometry or Phase I interface geometry" | Cả hai: `--glass_geometry` hoặc RANSAC + convex hull từ surface pass, có ngưỡng chất lượng | |
-| Renderer `R_3D^refl` | Tia không chung tâm `x + s r` | Kernel CUDA theo tia (closest approach), thứ tự theo depth của tâm | Xấp xỉ như 3DGS, mục 7.3 |
-| Vai trò của V_dyn (Eq. 9b) | Pose để mô tả hướng nhìn; dùng pose này trong pinhole chỉ là xấp xỉ | Tính theo từng vùng/frame, xuất ra `virtual_cameras.json`; là gốc tia trong ablation `pinhole_virtual_camera` | Render chính dùng tia đúng |
-| Đầu vào của h_ψ(u, t) | Hàm của pixel và thời gian | `γ(x_t(u))`, `γ(t)`, `cos θ` | Áp đúng chỗ kính ở view mới |
-| Chặn h_ψ | Không có, chỉ có clip[0,1] | Mặc định không chặn; `--optical_bound` để chặn | |
-| D-SSIM | Bị bỏ | `--lambda_dssim` mặc định 0 | |
-| Thứ tự trong L_motion | "neighboring timestamps", "ordered training sequence" | Frame liền trước cùng `source_clip` và `sensor_id` | Các clip khác nhau không liên tục |
-| Pháp tuyến 2DGS | 2DGS [1] | `DUAL_VISIABLE 1` | RT-Splatting tắt cờ này, làm L1 của Eq. 3a phạt đĩa quay lưng |
-| Densify, reset, prune | Không nói | Theo 3DGS/2DGS (mục 3) | Ổn định số điểm và bộ nhớ |
-| Khởi tạo G_R | Không nói | Điểm dọc theo tia, màu theo phần dư (mục 7.6) | |
-| Vùng hợp lệ Ω | "evaluated image pixels" | Pixel có pixel nguồn sau undistort | |
+| Occlusion in FirstHit | Eq. 9 considers only patches | Reject hits when frozen G_I depth (excluding the disk layer on the glass) is in front of the glass | You selected option A; `no_occlusion` ablation |
+| Glass-mask prior in Phase I | Eq. 3 contains only L1 + λ_s L_surf | Add λ_glass · BCE(glass_map, M_t) | Glass geometry is needed to extract `S_k` from Phase I (Sec. 1, Scope). Can be disabled with known geometry |
+| Source of `S_k` | "known geometry or Phase I interface geometry" | Both: `--glass_geometry` or RANSAC + convex hulls from the surface pass, with quality thresholds | |
+| Renderer `R_3D^refl` | Non-central rays `x + s r` | Ray-based CUDA kernel (closest approach), ordered by center depth | Approximation as in 3DGS, Section 7.3 |
+| Role of V_dyn (Eq. 9b) | Pose describing the viewing direction; using this pose in a pinhole renderer is only an approximation | Computed per region/frame, exported to `virtual_cameras.json`; used as the ray origin in the `pinhole_virtual_camera` ablation | The main renderer uses exact rays |
+| Inputs to h_ψ(u, t) | Function of pixel and time | `γ(x_t(u))`, `γ(t)`, `cos θ` | Applies corrections to the correct glass location in new views |
+| Bounding h_ψ | None, only clip[0,1] | Unbounded by default; `--optical_bound` enables a bound | |
+| D-SSIM | Omitted | `--lambda_dssim` defaults to 0 | |
+| Ordering in L_motion | "neighboring timestamps", "ordered training sequence" | Immediately preceding frame with the same `source_clip` and `sensor_id` | Different clips are not continuous |
+| 2DGS normals | 2DGS [1] | `DUAL_VISIABLE 1` | RT-Splatting disables this flag, causing the L1 term in Eq. 3a to penalize backward-facing disks |
+| Densification, reset, pruning | Not specified | Following 3DGS/2DGS (Section 3) | Stabilizes point count and memory use |
+| G_R initialization | Not specified | Points along rays, colors from residuals (Section 7.6) | |
+| Valid region Ω | "evaluated image pixels" | Pixels with a corresponding source pixel after undistortion | |
 
-## 13. Giới hạn và việc còn mở
+## 13. Limitations and open issues
 
-- Với scene chỉ có ảnh clean pseudo-GT (DAI), B bị buộc theo các ảnh đó, và G_I bị đóng băng ở Phase II đúng như framework yêu cầu. Phân tích trên VSGD 0758 trước đây cho thấy đây là nguồn chính khiến PSNR so với ảnh gốc thấp hơn RT-Splatting. Nên báo cáo kèm Transmission PSNR.
-- Hình học kính trích từ Phase I phụ thuộc vào prior mask và chất lượng Phase I. Ngưỡng chất lượng 0.5/0.5 chỉ là để chặn hình học hỏng, không phải thước đo độ chính xác.
-- **Hiệu năng.** Danh sách ứng viên tile được dựng bằng PyTorch (`tile_candidates`), còn kernel CUDA của từng pixel duyệt các entry của tile trực tiếp từ global memory (không dùng shared memory như 3DGS). Hai phần này chiếm phần lớn thời gian của Phase II và của render. Bộ nhớ tỉ lệ với số cặp (Gaussian, tile), bị giới hạn bởi `--max_tile_entries`. Hướng tối ưu: chuyển binning sang CUDA (duplicate keys + radix sort như 3DGS) và nạp Gaussian của tile vào shared memory.
-- Không mô hình khúc xạ, phản xạ lồng nhau, hay nhiều lần giao với kính (Scope của PDF).
-- Baseline RT-Splatting không nằm trong nhánh này (nhánh `quan_dang` đã thay `train.py` của RT). Hãy chạy nó từ `viet_huynh` hoặc `main`.
+- In scenes with only pseudo-GT clean images (DAI), B is constrained by those images, and G_I is frozen in Phase II as required by the framework. Earlier analysis on VSGD 0758 identified this as the main reason PSNR against the original images is lower than RT-Splatting. Transmission PSNR should also be reported.
+- Glass geometry extracted from Phase I depends on the mask prior and Phase I quality. The 0.5/0.5 quality thresholds only reject broken geometry; they do not measure accuracy.
+- **Performance.** Tile candidate lists are built using PyTorch (`tile_candidates`), while the per-pixel CUDA kernel traverses tile entries directly from global memory (without shared memory as in 3DGS). These two parts account for most of Phase II and rendering time. Memory scales with the number of (Gaussian, tile) pairs, bounded by `--max_tile_entries`. Optimization directions: move binning to CUDA (duplicate keys + radix sort, as in 3DGS) and load each tile's Gaussians into shared memory.
+- Refraction, nested reflections, and multiple glass intersections are not modeled (PDF Scope).
+- The RT-Splatting baseline is not included in this branch (the `quan_dang` branch replaced RT's `train.py`). Run it from `viet_huynh` or `main`.
 
-## 14. Lần chạy thử trên dữ liệu thật
+## 14. Trial run on real data
 
-3D-FRONT-T scene_1, `-r 4` (240×135), ảnh clean DAI, RTX 3050 Laptop 4 GB (GPU bị hạ xung do nhiệt, 240–712 MHz trong lúc chạy):
+3D-FRONT-T scene_1, `-r 4` (240×135), DAI clean images, RTX 3050 Laptop 4 GB (GPU thermally throttled to 240–712 MHz during the run):
 
 ```bash
 python train.py -s data/datasets/datasets/3D-FRONT-T/scene_1 -m output/smoke_3dfront_r4 -r 4 --iterations 1500 --skip_lpips     --reflection_args "--iterations 300 --test_interval 300 --checkpoint_interval 300 --densify_until_iter 250"
 ```
 
-| Bước | Kết quả |
+| Stage | Result |
 |---|---|
-| Phase I, 1500 vòng | 2 phút, VRAM đỉnh 577 MB; PSNR test của B so với ảnh clean 26.7 dB (linear); IoU của glass map 0.75 |
-| Trích kính | 4 patch cho hộp kính nhiều mặt, coverage 0.72, precision 0.62 (được chấp nhận) |
-| Che khuất | Bỏ lớp đĩa trên kính khỏi lượt render che khuất làm tỉ lệ báo nhầm trong mask giảm từ 3.9% xuống 2.2% (mục 6.3) |
-| Phase II, 300 vòng | 6.5 phút; PSNR test vùng kính (linear) 25.95 dB với direct, 27.63 dB với composite |
-| Render | Khoảng 0.86 s/frame khi GPU bị hạ xung (mục 13) |
+| Phase I, 1500 iterations | 2 minutes, peak VRAM 577 MB; test PSNR of B against clean images 26.7 dB (linear); glass-map IoU 0.75 |
+| Glass extraction | 4 patches for the glass box with multiple faces, coverage 0.72, precision 0.62 (accepted) |
+| Occlusion | Excluding the disk layer on the glass from the occlusion pass reduced the false-positive rate within the mask from 3.9% to 2.2% (Section 6.3) |
+| Phase II, 300 iterations | 6.5 minutes; test glass-region PSNR (linear) 25.95 dB for direct, 27.63 dB for composite |
+| Rendering | About 0.86 s/frame while the GPU was throttled (Section 13) |
 
-Đây chỉ là kiểm tra tích hợp (số vòng rất ít, độ phân giải thấp), không phải kết quả để báo cáo.
+This is only an integration check (very few iterations, low resolution), not a result suitable for reporting.
 

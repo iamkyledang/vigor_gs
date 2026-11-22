@@ -37,7 +37,7 @@ python render.py -m <model> --skip_train --components
 python metrics.py -m <model>
 
 # The ablation suite (shares Phase I where possible, writes <root>/summary.csv)
-python run_ablations.py -s <scene> --root output/<scene>_ablations -r 2
+python run_ablations.py -s <scene> --root output/<scene>_ablations   # 5 ablations; -r 1 for VSGD / 3D-FRONT-T, -r 2 for Wayve; full is read from <root>/full
 ```
 
 Interrupted runs continue with the same command (`train.py` skips or resumes each step). Outputs are described in [docs/implementation_details.md](docs/implementation_details.md#8-suy-luận-renderpy-eq-1213).

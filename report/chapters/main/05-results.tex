@@ -1,0 +1,96 @@
+\chapter{Experiments and Results}
+\section{Quantitative Results}
+
+% Fill the empty cells after evaluation. No numerical results are assumed.
+\begin{table}[!htbp]
+  \centering
+  \caption{Results on the first selected scene of each dataset. Blank cells are reserved for measured values.}
+  \label{tab:quantitative-results}
+  \small
+  \setlength{\tabcolsep}{5pt}
+  \renewcommand{\arraystretch}{1.5}
+  \begin{tabularx}{\linewidth}{@{}Xccccc@{}}
+    \toprule
+    Scene & \shortstack{PSNR\\(dB) $\uparrow$}
+          & SSIM $\uparrow$ & LPIPS $\downarrow$
+          & \shortstack{Glass PSNR\\(dB) $\uparrow$}
+          & \shortstack{Transmission\\PSNR (dB) $\uparrow$}\\
+    \midrule
+    VSGD / 0758 & & & & & \\
+    WayveScene101 / scene\_001 & & & & & \\
+    3D-FRONT-T / scene\_1 & & & & & \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+% Add the quantitative analysis here.
+\vspace{1.5cm}
+
+\clearpage
+\section{Qualitative Results}
+
+\begin{figure}[!htbp]
+  \centering
+  \fbox{\begin{minipage}[c][3.5cm][c]{0.92\linewidth}
+    \centering VSGD / 0758\\[3mm]
+    Reference, reconstruction, direct component, and reflection component
+    % Insert qualitative results for VSGD scene 0758.
+  \end{minipage}}
+  \caption{Qualitative results for VSGD scene 0758.}
+  \label{fig:results-vsgd}
+\end{figure}
+
+\begin{figure}[!htbp]
+  \centering
+  \fbox{\begin{minipage}[c][3.5cm][c]{0.92\linewidth}
+    \centering WayveScene101 / scene\_001\\[3mm]
+    Reference, reconstruction, direct component, and reflection component
+    % Insert qualitative results for WayveScene101 scene 001.
+  \end{minipage}}
+  \caption{Qualitative results for WayveScene101 scene 001.}
+  \label{fig:results-wayve}
+\end{figure}
+
+\begin{figure}[!htbp]
+  \centering
+  \fbox{\begin{minipage}[c][3.5cm][c]{0.92\linewidth}
+    \centering 3D-FRONT-T / scene\_1\\[3mm]
+    Reference, reconstruction, direct component, and reflection component
+    % Insert qualitative results for 3D-FRONT-T scene 1.
+  \end{minipage}}
+  \caption{Qualitative results for 3D-FRONT-T scene 1.}
+  \label{fig:results-3dfront}
+\end{figure}
+
+\clearpage
+\section{Ablation Study}
+
+% Specify the evaluated variants and enter their measurements here.
+\begin{table}[!htbp]
+  \centering
+  \caption{Ablation study template.}
+  \label{tab:ablation-results}
+  \renewcommand{\arraystretch}{1.5}
+  \begin{tabularx}{\linewidth}{@{}Xcccc@{}}
+    \toprule
+    Variant & PSNR $\uparrow$ & SSIM $\uparrow$ & LPIPS $\downarrow$
+            & \shortstack{Transmission\\PSNR $\uparrow$}\\
+    \midrule
+    \strut & & & & \\
+    \strut & & & & \\
+    \strut & & & & \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+% Add the ablation analysis after measurements are available.
+\vspace{2cm}
+
+\section{Discussion and Limitations}
+\subsection*{Discussion}
+% Discuss the measured results and observations here.
+\vspace{2.5cm}
+
+\subsection*{Limitations}
+% Describe supported limitations and failure cases here.
+\vspace{2.5cm}

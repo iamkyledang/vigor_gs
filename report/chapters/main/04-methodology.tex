@@ -1,0 +1,204 @@
+\chapter{Methodology}
+\section{Formulation}
+\label{sec:formulation}
+
+VIGOR-GS represents a scene using an interface field and a reflection field. The interface field describes the direct appearance visible through the real camera. The reflection field describes the content observed along reflected rays. Training first estimates the interface field from reflection-removed images. It then fixes this field and learns the reflected appearance from the original images.
+
+\begin{figure}[!htbp]
+  \centering
+  \fbox{\begin{minipage}[c][4cm][c]{0.92\linewidth}
+    \centering
+    Pipeline diagram
+    % Replace this box with the pipeline diagram.
+  \end{minipage}}
+  \caption{Overview of the two-stage training and rendering pipeline.}
+  \label{fig:vigor-pipeline}
+\end{figure}
+
+\subsection{Scene representation}
+For each training frame, the inputs are an observed image $I_t$, a reflection-removed target $I_t^{\mathrm{clean}}$, a calibrated camera $C_t$, and a normalized timestamp $t$. A glass mask $M_t$ provides supervision for locating the interface. All image formation and training losses use linear RGB values.
+
+The canonical interface field $\mathcal{G}_{\mathrm{I}}^0$ contains oriented 2D Gaussian disks~\cite{huang2024}. Each disk has a center, an orientation, two in-plane scales, appearance coefficients, occupancy $p_i$, and optical opacity $o_i$. Its effective rendering opacity is
+\begin{equation}
+  \widetilde{o}_i = p_i o_i.
+  \label{eq:interface-opacity}
+\end{equation}
+Occupancy describes the presence of the surface element. Optical opacity controls its contribution to the direct image. Glass-mask supervision provides an additional constraint on the interface geometry.
+
+The canonical reflection field $\mathcal{G}_{\mathrm{R}}^0$ contains 3D Gaussian ellipsoids~\cite{kerbl2023}. It has independent geometry, opacity, and appearance parameters. Separate deformation networks map the two canonical fields to time $t$,
+\begin{equation}
+  \begin{aligned}
+    \mathcal{G}_{\mathrm{I}}(t)
+      &= \mathcal{D}_{\phi_{\mathrm{I}}}(\mathcal{G}_{\mathrm{I}}^0,t),\\
+    \mathcal{G}_{\mathrm{R}}(t)
+      &= \mathcal{D}_{\phi_{\mathrm{R}}}(\mathcal{G}_{\mathrm{R}}^0,t).
+  \end{aligned}
+  \label{eq:time-fields}
+\end{equation}
+The networks deform Gaussian centers, orientations, and scales. Occupancy, opacity, and appearance coefficients remain in the canonical representation. The two networks have separate parameters, allowing the fields to describe independent motion.
+
+\subsection{Interface reconstruction}
+The first phase renders the interface field through the real camera,
+\begin{equation}
+  B_t = \mathcal{R}_{\mathrm{2D}}\bigl(\mathcal{G}_{\mathrm{I}}(t),C_t\bigr).
+  \label{eq:direct-render}
+\end{equation}
+Here $B_t$ is the predicted direct image. For a valid pixel set $\Omega$, the photometric error is defined as
+\begin{equation}
+  \ell_{\Omega}(A,B)
+    = \frac{1}{|\Omega|}\sum_{\mathbf{u}\in\Omega}
+      \left\|A(\mathbf{u})-B(\mathbf{u})\right\|_1.
+  \label{eq:photometric-error}
+\end{equation}
+The loss sums the absolute RGB differences at each pixel and averages them over valid pixels.
+
+The interface is optimized against the reflection-removed target. Surface consistency encourages agreement between the rendered normals $N_t$ and normals $N_t^{\mathrm{depth}}$ derived from the rendered depth,
+\begin{equation}
+  \mathcal{L}_{\mathrm{surf}}
+    = \frac{1}{|\Omega_{\mathrm{s}}|}
+      \sum_{\mathbf{u}\in\Omega_{\mathrm{s}}}
+      \left\|N_t(\mathbf{u})-N_t^{\mathrm{depth}}(\mathbf{u})\right\|_1.
+  \label{eq:surface-consistency}
+\end{equation}
+The set $\Omega_{\mathrm{s}}$ contains pixels with valid normals in both maps. The implementation also applies a glass-mask loss $\mathcal{L}_{\mathrm{glass}}$. This is the binary cross-entropy between the predicted glass map and the training mask $M_t$. The combined objective is
+\begin{equation}
+  \mathcal{L}_{\mathrm{I}}
+    = \ell_{\Omega}(B_t,I_t^{\mathrm{clean}})
+      + \lambda_{\mathrm{s}}\mathcal{L}_{\mathrm{surf}}
+      + \lambda_{\mathrm{g}}\mathcal{L}_{\mathrm{glass}}.
+  \label{eq:interface-objective}
+\end{equation}
+This phase updates the interface Gaussians and their deformation network. The trained parameters are then frozen before reflection reconstruction.
+
+\subsection{Reflection reconstruction}
+The glass geometry consists of finite planar patches,
+\begin{equation}
+  \mathcal{P}=\{\Pi_k=(\mathbf{n}_k,d_k,\mathcal{S}_k)\}_{k=1}^{K},
+  \qquad \mathbf{n}_k^{\top}\mathbf{x}+d_k=0.
+  \label{eq:glass-patches}
+\end{equation}
+The vector $\mathbf{n}_k$ is a unit normal and $\mathcal{S}_k$ defines the finite support of patch $k$. Known patch geometry may be supplied directly. Otherwise, RANSAC fits planar patches to interface samples inside the training glass regions. Their geometry remains fixed in the second phase.
+
+For each pixel, the renderer selects the nearest visible glass patch intersected by the real camera ray. The implementation rejects a glass hit when the frozen interface depth indicates an opaque object in front of it. Let $\mathbf{x}_t(\mathbf{u})$ be the accepted hit point and $\mathbf{d}_t(\mathbf{u})$ the incoming unit direction. The reflected direction is
+\begin{equation}
+  \mathbf{r}_t(\mathbf{u})
+    = \mathbf{d}_t(\mathbf{u})
+      - 2\bigl(\mathbf{n}_t(\mathbf{u})^{\top}\mathbf{d}_t(\mathbf{u})\bigr)
+        \mathbf{n}_t(\mathbf{u}).
+  \label{eq:reflection-direction}
+\end{equation}
+A geometry-driven virtual-camera function adapts its viewing configuration to the selected patch. The reflection renderer queries one shared field $\mathcal{G}_{\mathrm{R}}(t)$ along the per-pixel rays originating at the glass hits. These queries form the reflection image $R_t$. Different visible patches use the same field and camera function.
+
+The reflection weight follows Schlick's Fresnel approximation~\cite{schlick1994},
+\begin{equation}
+  \begin{aligned}
+    F_0 &= \left(\frac{\eta_{\mathrm{a}}-\eta_{\mathrm{g}}}
+                         {\eta_{\mathrm{a}}+\eta_{\mathrm{g}}}\right)^2,\\
+    F_t(\mathbf{u})
+      &= F_0+(1-F_0)
+         \bigl(1-|\mathbf{n}_t(\mathbf{u})^{\top}\mathbf{d}_t(\mathbf{u})|\bigr)^5.
+  \end{aligned}
+  \label{eq:fresnel-weight}
+\end{equation}
+Here $\eta_{\mathrm{a}}$ and $\eta_{\mathrm{g}}$ are the refractive indices of air and glass. A learned correction $h_{\psi}(\mathbf{u},t)$ adjusts the base weight,
+\begin{equation}
+  \alpha_t(\mathbf{u})
+    = \operatorname{clip}_{[0,1]}
+      \bigl(F_t(\mathbf{u})+h_{\psi}(\mathbf{u},t)\bigr).
+  \label{eq:adjusted-weight}
+\end{equation}
+Pixels without a visible glass hit have $\alpha_t=0$. The final prediction combines the frozen direct image and the learned reflection image,
+\begin{equation}
+  \widehat{I}_t(\mathbf{u})
+    = \bigl(1-\alpha_t(\mathbf{u})\bigr)B_t(\mathbf{u})
+      + \alpha_t(\mathbf{u})R_t(\mathbf{u}).
+  \label{eq:composite-image}
+\end{equation}
+
+\subsection{Training objective and inference}
+The second phase fits the composite image to the original observation,
+\begin{equation}
+  \mathcal{L}_{\mathrm{R}}
+    = \ell_{\Omega}(\widehat{I}_t,I_t)
+      + \lambda_{\mathrm{m}}\mathcal{L}_{\mathrm{motion}}
+      + \lambda_{\mathrm{o}}\mathcal{L}_{\mathrm{opt}}.
+  \label{eq:reflection-objective}
+\end{equation}
+The temporal term matches the observed changes between neighboring training frames. Pairs are drawn from the same sequence and camera. With $t^{-}$ denoting the preceding training timestamp, the regularizers are
+\begin{equation}
+  \begin{aligned}
+    \mathcal{L}_{\mathrm{motion}}
+      &= \ell_{\Omega_{\cap}}
+         \bigl(\widehat{I}_t-\widehat{I}_{t^{-}},\ I_t-I_{t^{-}}\bigr),\\
+    \mathcal{L}_{\mathrm{opt}}
+      &= \frac{1}{|\Omega|}\sum_{\mathbf{u}\in\Omega}
+          h_{\psi}(\mathbf{u},t)^2.
+  \end{aligned}
+  \label{eq:reflection-regularizers}
+\end{equation}
+The set $\Omega_{\cap}$ contains pixels valid in both frames. The optical term discourages large corrections to the Fresnel weight. Only the reflection field, its deformation network, and the correction model are updated in this phase.
+
+At inference, both fields are evaluated at the requested timestamp. The real camera determines the direct render and the visible glass intersections. Reflected rays determine the reflection render, and Eq.~\eqref{eq:composite-image} produces the final image. All learned parameters remain fixed. The model accounts for the first visible glass interaction and omits refraction and multiple reflections.
+
+\section{Data Preparation}
+
+Scenes are manually selected from VSGD, WayveScene101, and 3D-FRONT-T. The selected scenes contain visible glass and overlapping reflected and transmitted content. The initial evaluation uses VSGD scene 0758, WayveScene101 scene 001, and 3D-FRONT-T scene 1.
+
+The frames are ordered chronologically and assigned an approximately $80\%/20\%$ training/test split. Within each group of five frames, the third frame is held out for evaluation. The first and last frames remain in the training set. This interleaving places test timestamps between training observations and evaluates time interpolation. Timestamps are normalized to $[0,1]$ over the full sequence. Table~\ref{tab:scene-splits} gives the saved frame counts.
+
+\begin{table}[!htbp]
+  \centering
+  \caption{Selected scenes and temporal interpolation splits.}
+  \label{tab:scene-splits}
+  \begin{tabular}{@{}llrrr@{}}
+    \toprule
+    Dataset & Scene & Total & Training & Test\\
+    \midrule
+    VSGD & 0758 & 146 & 117 & 29\\
+    WayveScene101 & scene\_001 & 200 & 160 & 40\\
+    3D-FRONT-T & scene\_1 & 171 & 137 & 34\\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+COLMAP reconstructions are rebuilt for the selected scenes. VSGD uses both training and test RGB frames for camera estimation and sparse reconstruction. WayveScene101 and 3D-FRONT-T retain their provided calibration and rebuild sparse geometry from training frames. Test camera records are then added without test observations in the sparse point cloud. These calibration protocols are retained when comparing methods on the same scene. Gaussian model parameters are optimized using training frames only.
+
+DiffusionRenderer provides depth and surface-normal estimates as geometry priors during scene preparation. These estimates support inspection of the scene layout and glass geometry. The surface-consistency term in Eq.~\eqref{eq:surface-consistency} uses normals derived from the rendered depth. This keeps the training objective consistent with the implemented formulation.
+
+Glass masks are rebuilt for the selected frames and checked against the image boundaries. Masks, reflection-removed targets, and RGB frames are aligned to the same undistorted COLMAP image grid. Intrinsics are scaled consistently when images are resized. Reflection-removed targets supervise the first phase, while original RGB frames supervise the second phase. Test images are used for evaluation rather than gradient updates. Test masks define evaluation regions and are not used to blend the predicted reflection and direct images.
+
+\section{Configurations and Hardware Setup}
+
+The experimental setup uses an NVIDIA RTX PRO 6000 Blackwell GPU. The lab environment is configured with Python 3.11 and PyTorch 2.9.1. It uses CUDA 12.8 runtime wheels and a CUDA 12.9 toolkit to build the custom rendering extensions.
+
+The two training phases use separate Adam optimizers and process one sampled training view per iteration. Unless an experiment specifies an override, the main settings follow the repository defaults in Table~\ref{tab:training-config}. The interface remains frozen throughout the second phase.
+
+\begin{table}[!htbp]
+  \centering
+  \caption{Main training and rendering settings.}
+  \label{tab:training-config}
+  \small
+  \begin{tabularx}{\linewidth}{@{}Xl@{}}
+    \toprule
+    Setting & Value\\
+    \midrule
+    Iterations per phase & 30,000\\
+    Deformation MLP & 4 hidden layers, 128 units per layer\\
+    Spatial and temporal encoding & 6 frequency bands each\\
+    Spherical harmonics degree & 3\\
+    Deformation warm-up & 1,000 iterations\\
+    Initial position learning rate & $1.6\times10^{-4}$\\
+    Final position learning rate & $1.6\times10^{-6}$\\
+    Initial deformation learning rate & $1.6\times10^{-4}$\\
+    Optical correction learning rate & $10^{-3}$\\
+    Densification window & Iterations 500--15,000\\
+    Densification interval & 100 iterations\\
+    Surface and glass-mask weights & $\lambda_{\mathrm{s}}=0.05$, $\lambda_{\mathrm{g}}=0.05$\\
+    Motion and optical weights & $\lambda_{\mathrm{m}}=0.1$, $\lambda_{\mathrm{o}}=0.01$\\
+    Refractive indices & $\eta_{\mathrm{a}}=1.0$, $\eta_{\mathrm{g}}=1.5$\\
+    Random seed & 0\\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+The lab configuration uses the native COLMAP image size for VSGD. WayveScene101 and 3D-FRONT-T use a downsampling factor of two along each image dimension. Evaluation uses the corresponding image resolution for each scene. The same held-out frames are used for all comparisons within a scene.

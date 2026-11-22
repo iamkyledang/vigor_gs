@@ -1,0 +1,90 @@
+\chapter{Theoretical Background}
+
+\section{3D Gaussian Splatting}
+
+3D Gaussian Splatting (3DGS)~\cite{kerbl2023} represents a scene using a collection of ellipsoidal Gaussian primitives in three-dimensional space. Each Gaussian is characterized by a center \(\boldsymbol{\mu}_i \in \mathbb{R}^3\), a covariance matrix \(\boldsymbol{\Sigma}_i \in \mathbb{R}^{3 \times 3}\), an opacity \(o_i\), and spherical harmonics (SH) coefficients for view-dependent color.
+
+The spatial distribution of each Gaussian describes how its contribution varies across 3D space. The mean \(\boldsymbol{\mu}_i\) determines its center, while the covariance matrix \(\boldsymbol{\Sigma}_i\) controls its spatial extent, shape, and orientation. The unnormalized Gaussian function at a point \(\mathbf{x}\) is
+\begin{equation}
+  G_i(\mathbf{x}) =
+  \exp\left[-\frac{1}{2}
+    (\mathbf{x}-\boldsymbol{\mu}_i)^{\mathsf{T}}
+    \boldsymbol{\Sigma}_i^{-1}
+    (\mathbf{x}-\boldsymbol{\mu}_i)\right].
+  \label{eq:gaussian-3d}
+\end{equation}
+The function reaches its maximum at the Gaussian center and decreases with distance according to the covariance matrix. To maintain a valid covariance during optimization, 3DGS parameterizes it using a rotation matrix \(\mathbf{R}_i\) and a scaling matrix \(\mathbf{S}_i\):
+\[
+  \boldsymbol{\Sigma}_i =
+  \mathbf{R}_i\mathbf{S}_i\mathbf{S}_i^{\mathsf{T}}\mathbf{R}_i^{\mathsf{T}}.
+\]
+This representation allows Gaussians to adapt their shapes to scene structures, while opacity and SH coefficients control their rendering contributions and view-dependent appearance.
+
+\section{2D Gaussian Splatting}
+
+2D Gaussian Splatting (2DGS)~\cite{huang2024} represents scene surfaces using planar Gaussian primitives embedded in 3D space. Each primitive is defined on a local tangent plane with an explicit surface orientation. A primitive is parameterized by its center \(\boldsymbol{\mu}_i\), two orthogonal unit tangent vectors \(\mathbf{t}_{u,i}\) and \(\mathbf{t}_{v,i}\), and scaling factors \(s_{u,i}\) and \(s_{v,i}\). Points on its plane are expressed as
+\[
+  \mathbf{P}_i(u,v) =
+  \boldsymbol{\mu}_i + s_{u,i}u\mathbf{t}_{u,i} + s_{v,i}v\mathbf{t}_{v,i},
+\]
+with surface normal \(\mathbf{n}_i = \mathbf{t}_{u,i} \times \mathbf{t}_{v,i}\). For a camera ray that intersects the tangent plane, the Gaussian is evaluated at the resulting local coordinates \((u,v)\):
+\begin{equation}
+  G_i(u,v) = \exp\left(-\frac{u^2 + v^2}{2}\right).
+  \label{eq:gaussian-2d}
+\end{equation}
+This surface-aligned formulation supports perspective-correct rendering and consistent depth and normal estimates across viewpoints.
+
+\section{Gaussian Rasterization}
+
+Gaussian rasterization determines which primitives contribute to each pixel and combines their colors. 3DGS and 2DGS use different procedures to evaluate the contribution of each Gaussian.
+
+\paragraph{Rasterization in 3DGS.}
+In 3DGS~\cite{kerbl2023}, each Gaussian is projected onto the image plane, producing an elliptical footprint. The projection transforms the covariance as
+\[
+  \boldsymbol{\Sigma}'_i =
+  \mathbf{J}_i\mathbf{W}\boldsymbol{\Sigma}_i
+  \mathbf{W}^{\mathsf{T}}\mathbf{J}_i^{\mathsf{T}},
+\]
+where \(\mathbf{W}\) is the linear part of the viewing transformation and \(\mathbf{J}_i\) is the Jacobian of perspective projection evaluated at the Gaussian center in camera coordinates. The upper-left \(2 \times 2\) submatrix gives the image-plane covariance. Together with the projected center, it determines the Gaussian's contribution at each pixel through the two-dimensional form of Equation~\eqref{eq:gaussian-3d}.
+
+\paragraph{Rasterization in 2DGS.}
+In 2DGS~\cite{huang2024}, a ray from the camera center through a given pixel intersects the Gaussian's tangent plane. The intersection is expressed in the Gaussian's local coordinates \((u,v)\), and the Gaussian is evaluated using Equation~\eqref{eq:gaussian-2d}. Using the ray--plane intersection accounts for the viewing perspective when evaluating the Gaussian and determining the intersection depth.
+
+\paragraph{Alpha Compositing.}
+Both 3DGS and 2DGS use tile-based rasterization. Each tile processes only the Gaussians that overlap it, sorts them by depth, and combines their colors from front to back. The effective opacity of Gaussian \(i\) at pixel \(p\) is
+\[
+  \alpha_i(p) = o_i G_i(p),
+\]
+where \(o_i\) is the Gaussian's opacity and \(G_i(p)\) is its evaluated weight at that pixel. The final pixel color for \(N\) depth-sorted Gaussians is
+\[
+  \mathbf{C}(p) = \sum_{i=1}^{N} T_i(p)\,\alpha_i(p)\,\mathbf{c}_i,
+  \qquad
+  T_i(p) = \prod_{j=1}^{i-1}\bigl(1-\alpha_j(p)\bigr).
+\]
+Here, \(\mathbf{c}_i\) is the view-dependent color of Gaussian \(i\), and \(T_i(p)\) is the fraction of light remaining after contributions from closer Gaussians.
+
+\clearpage
+\section{Occupancy--Opacity Factorization}
+
+In standard Gaussian Splatting, opacity determines how much a Gaussian blocks the scene behind it. However, using the same parameter to represent surface geometry creates a problem for transparent materials. Reducing opacity allows the background to remain visible, but also weakens the representation of the transparent surface. RT-Splatting~\cite{shi2026} addresses this limitation by separating geometric occupancy from optical opacity.
+
+Specifically, geometric occupancy \(\sigma_i \in [0,1]\) represents the probability that a ray interacts with the material of Gaussian \(i\), while optical opacity \(\alpha_i \in [0,1]\) represents the probability that light is absorbed or scattered when this interaction occurs. The two parameters are combined to define the effective opacity:
+\[
+  \alpha_i^{\mathrm{eff}} = \sigma_i \alpha_i.
+\]
+This allows a transparent surface to maintain high geometric occupancy while having low optical opacity, preserving its surface representation without strongly blocking the background.
+
+To estimate the surface encountered by a camera ray, RT-Splatting assigns each Gaussian a weight:
+\[
+  p_i(\mathbf{p}) =
+  \sigma_i G_i(\mathbf{p})
+  \prod_{j=1}^{i-1}
+  \left(1 - \sigma_j G_j(\mathbf{p})\right).
+\]
+Here, \(G_i(\mathbf{p})\) is the Gaussian value at pixel \(\mathbf{p}\), and \(p_i(\mathbf{p})\) represents the probability that Gaussian \(i\) is the first surface encountered along the ray, accounting for the Gaussians in front of it.
+
+These weights are then used to combine the surface attributes of the Gaussians:
+\[
+  \mathbf{A} = \sum_i p_i(\mathbf{p}) \mathbf{a}_i,
+\]
+where \(\mathbf{a}_i\) denotes a surface attribute of Gaussian \(i\), such as its normal or roughness, and \(\mathbf{A}\) is the resulting weighted surface attribute at the pixel.

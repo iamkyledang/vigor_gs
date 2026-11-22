@@ -1,0 +1,47 @@
+% !TeX program = pdflatex
+% Layout adapted from specialized_report_EN. Existing report content is preserved.
+\documentclass[english,final]{hcmut-thesis}
+\usepackage{amsmath,amssymb}
+\usepackage{array,tabularx,booktabs}
+\usepackage[nameinlink]{cleveref}
+\input{report-info}
+\setlength{\emergencystretch}{2em}
+
+\reporttype{\ReportCourse{}\\[2mm]{\normalsize Semester \ReportSemester}}
+\title{\ReportTitle}
+\stumajor{Computer Science}
+\reporttime{\ReportDate}
+\supervisor{\ReportSupervisor\\\ReportSupervisorTwo}
+\stuname{%
+  \begin{tabular}{@{}l@{\hspace{1em}}l@{}}
+    \ReportStudent & -- \ReportStudentID\\
+    \ReportStudentTwo & -- \ReportStudentIDTwo
+  \end{tabular}}
+\hypersetup{pdftitle={DACN HK261 Specialized Project Report},
+  pdfauthor={\ReportStudent; \ReportStudentTwo}}
+\newcommand{\placeholder}[1]{\par\noindent\textit{[#1]}\par}
+
+\begin{document}
+\hypersetup{pageanchor=false}
+\coverpage
+\frontmatter
+\hypersetup{pageanchor=true}
+\tableofcontents
+\clearpage
+\listoffigures
+\clearpage
+\listoftables
+
+\mainmatter
+\counterwithin{equation}{chapter}
+\counterwithin{table}{chapter}
+\counterwithin{figure}{chapter}
+\include{chapters/main/01-introduction}
+\include{chapters/main/02-related-work}
+\include{chapters/main/03-theoretical-background}
+\include{chapters/main/04-methodology}
+\include{chapters/main/05-results}
+\include{chapters/main/06-conclusion}
+
+\input{refs/references}
+\end{document}
