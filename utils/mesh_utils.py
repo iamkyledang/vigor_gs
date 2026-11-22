@@ -10,7 +10,6 @@
 #
 
 import os
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import open3d as o3d
@@ -18,6 +17,7 @@ import torch
 from tqdm import tqdm
 
 from utils.image_utils import apply_colormap, log_normalize
+from utils.memory_utils import BoundedExecutor
 from utils.render_utils import save_img_u8
 
 
@@ -108,7 +108,7 @@ class GaussianExtractor(object):
             os.makedirs(gts_path, exist_ok=True)
             os.makedirs(masks_path, exist_ok=True)
 
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        with BoundedExecutor(max_workers=8, max_pending=32) as executor:  # bounded: pending images cannot fill the RAM
             for i, viewpoint_cam in tqdm(enumerate(self.viewpoint_stack), desc='reconstruct radiance fields'):
                 torch.cuda.empty_cache()
                 render_pkg = self.render(viewpoint_cam, self.gaussians, bg_color=self.background)
